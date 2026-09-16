@@ -1,0 +1,18 @@
+version: 1
+project: little-loom
+build:
+  install: npm ci --ignore-scripts
+  command: npm run build
+  output: dist
+runtime:
+  mode: edge
+database:
+  enabled: false
+auth:
+  provider: none
+mail:
+  enabled: false
+storage:
+  provider: r2
+  jurisdiction: us
+  public: false
