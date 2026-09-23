@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
-    "@ohmyhost/customer-runtime": "https://ohmyho.st/releases/0.1.13/ohmyhost-customer-runtime-0.1.13.tgz",
+    "@ohmyhost/customer-runtime": "https://ohmyho.st/releases/0.1.14/ohmyhost-customer-runtime-0.1.14.tgz",
     "@radix-ui/react-slot": "1.3.3",
     "@radix-ui/react-switch": "1.3.7",
     "class-variance-authority": "0.7.1",
