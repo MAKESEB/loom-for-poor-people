@@ -1,24 +1,58 @@
-# Little Loom
+# Slop Rooster
 
-A small screen recorder: record a screen or window, preview it, save it, and share a UUID link. Anyone with the link can watch without an account. There is no public recording directory.
+A small screen recorder: enter the shared access UUID, record, stop, and copy a link. Videos upload automatically. Two optional controls protect the link with a permanent viewing token and generate Markdown from the recording with Gemini.
 
-- Optional microphone and browser-supported screen audio.
-- Pause, resume, stop, preview, and download locally.
-- Upload progress and retries that keep the recorded video in the tab.
-- Public `/v/<uuid>` player and streaming video with byte-range support.
-- Separate private upload tokens: knowing a viewing UUID does not authorize completing or replacing an upload.
-- Up to 15 minutes or 50 MiB per recording, whichever comes first. Browser capture support varies; use a desktop browser over HTTPS or localhost.
-
-## Develop
+## Run locally
 
 Use Node.js 22 or later and npm 10.9.8.
 
 ```sh
 npm ci
+npm run setup
 npm run dev
 ```
 
-Open the local URL printed by Vite. Development uses `.local/storage` on disk, so saved links continue working after reloading or restarting the server. This adapter is only part of the local Vite server; production never falls back to a developer's disk or process memory.
+`npm run setup` creates private `.env.local` settings and preserves existing values. Read `SLOP_ROOSTER_ACCESS_UUID` there to sign in. Add your Gemini API key privately as `GEMINI_API_KEY` to enable Markdown; recording and sharing work without it. Never prefix a server secret with `VITE_`.
+
+Local development uses disk-backed private files in `.local/storage` and embedded Postgres (PGlite) in `.local/database`. It runs the same SQL migration as hosting. The local recovery interval is 15 seconds; hosted recovery runs every five minutes. `npm run preview` serves the frontend build only; use `npm run dev` for the full application.
+
+## Record and share
+
+- Desktop screen, window or tab recording, optional microphone and browser-supported screen audio.
+- Pause/resume, automatic upload when stopped, and local download if an upload needs retrying.
+- Up to 15 minutes or 50 MiB per video.
+- Unlisted `/v/<uuid>` viewer; no public recording directory.
+- **Protect link** requires a permanent per-video token for metadata, playback, seeking and Markdown/downloads. It is access control, not end-to-end encryption.
+- **Generate Markdown** reveals a goal field. Only pressing **Generate** sends the video to Gemini. An empty goal produces a briefing; a custom goal can request a transcript or another format.
+- Markdown appears beneath the video and supports copy/download. Disabling the toggle hides it from viewers without deleting the saved result.
+
+Everyone with the shared access UUID has the same creator privileges. Viewers need only their complete sharing link. Creator sessions use signed host-bound cookies for 30 days. Rotating the access UUID or session secret invalidates creator sessions; rotating `SHARE_TOKEN_SECRET` invalidates previously issued protected viewing links.
+
+## Runtime and background work
+
+The Vite API companion uses the ohmyho.st private Storage Gateway and database runtime SDK. Videos remain private; authenticated same-origin application routes stream uploads and authorized playback. Database rows persist upload reservations, sharing settings and Markdown jobs.
+
+Videos are streamed as inline Base64 input to Gemini background Interactions, with bounded byte counts and timeouts. The response reader discards echoed video data while retaining bounded Markdown output. The Files adapter remains available to recover existing jobs; the current provider rejects Files-backed video references in background Interactions, so new jobs use the verified inline path. Durable jobs use database claims, expiring leases and fencing to prevent concurrent Dev/production workers from publishing stale results. Known provider IDs can be reconciled after reload or by scheduled recovery; opening a viewing page never starts a new billable generation. Videos larger than 10 MiB start on the next scheduled run (up to five minutes), keeping large transfers outside the short HTTP background-work window.
+
+An ambiguous Gemini creation result is marked uncertain and requires an explicit new attempt. It is never silently resubmitted. Finished Markdown is stored before temporary provider data is deleted; cleanup failures are retried independently. AI failures leave the video usable. Markdown rendering disables raw HTML and unsafe links.
+
+## Hosting
+
+The authorized deployment is in the **MAKESEB** workspace, in the **EU**, with **shared Dev/production data**. `ohmyhost.yaml` enables only hosting, private storage, Postgres, scheduled recovery and the Gemini API egress origin. Application access is custom UUID authentication; managed auth and mail are disabled.
+
+Server settings, installed through the hosting CLI's stdin-only secret workflow in both environments:
+
+- `SLOP_ROOSTER_ACCESS_UUID`
+- `APP_SESSION_SECRET`
+- `SHARE_TOKEN_SECRET`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (default `gemini-3.8-flash`)
+
+Keep the access/share secrets compatible between environments because videos and settings are shared. Browser cookies remain host-bound. Test writes and migrations affect shared data. Keep schema changes additive and verify existing links before promotion.
+
+Follow the official [deployment workflow](https://ohmyho.st/skills/ohmyhost-deploy-github/SKILL.md): inspect, link the exact pushed GitHub commit, review its plan, deploy Dev, verify its protected URL, then promote the same artifact. A successful build or root HTTP response alone is not application verification.
+
+## Verification
 
 ```sh
 npm run typecheck
@@ -27,22 +61,6 @@ npm run build
 ohmyhost init --dry-run --json
 ```
 
-`npm run preview` previews the static build only. Use `npm run dev` to exercise the local API and storage together.
+Tests cover authentication, origin checks, upload limits and idempotency, viewer permissions, byte ranges, real Postgres job claims/fencing, provider failures, uncertainty and cleanup. `/tests/recorder.html` is a local-only browser fixture using an animated canvas and real MediaRecorder encoding. It is excluded from production. A real operating-system screen picker and microphone permission remain under browser control.
 
-## Browser verification
-
-`/tests/recorder.html` is a development-only fixture. It substitutes an animated canvas for the operating system screen picker while retaining real MediaRecorder encoding, the full UI, upload APIs, disk storage, and playback. Turn off the microphone when using the fixture to avoid recording ambient sound. The fixture is not included in the production build.
-
-For a real capture check, open `/`, start a recording, choose a window, pause and resume, then stop from the browser's sharing control. Save, open the UUID link in another tab, reload it, and test playback and seeking. Screen and microphone permissions always remain under browser control.
-
-## Hosting on ohmyho.st
-
-The repository uses the supported Vite companion at `src/ohmyhost/companion.ts` and the private storage SDK from `@ohmyhost/customer-runtime/storage`. `ohmyhost.yaml` enables only edge hosting and private file storage in the supported US jurisdiction. Database, application authentication, and mail are disabled.
-
-Hosting setup and promotion follow the official [setup](https://ohmyho.st/skills/ohmyhost-get-started/SKILL.md) and [GitHub deployment](https://ohmyho.st/skills/ohmyhost-deploy-github/SKILL.md) instructions. Authenticate with `ohmyhost login --json`, reuse the selected organization/project, authorize this GitHub repository, and plan the exact pushed commit. Verify the protected Dev application before promoting that artifact to the public production URL.
-
-### Current storage integration constraint
-
-The beta.40 inspection contract reports a `FILES` binding. Its public runtime documentation requires `createPrivateStorageClient`, whose constructor needs a gateway connection and project/environment identifiers, but does not document how to obtain that connection from the deployment bindings. Production storage must be verified against the actual supported runtime contract before publication. The application fails closed when no supported storage client has been connected; it never guesses a gateway credential or uses a platform management token in application code.
-
-Recordings are unlisted, not confidential: sharing a UUID grants viewing access. The public recorder accepts uploads without an account, subject to application limits and the hosting project's storage quota. No authentication provider, database, mail, custom domain, or automatic deployment is required.
+Deployment IDs, live checks and sanitized diagnostic reports are retained in the ignored `.local/ohmyhost-diagnostics/` directory. Credentials, cookies, signed storage URLs and viewing tokens must not be copied into reports or commits.

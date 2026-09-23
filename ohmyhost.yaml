@@ -1,18 +1,25 @@
 version: 1
-project: little-loom
+project: slop-rooster
 build:
   install: npm ci --ignore-scripts
   command: npm run build
   output: dist
 runtime:
   mode: edge
+  egress:
+    allow:
+      - https://generativelanguage.googleapis.com
 database:
-  enabled: false
+  enabled: true
+  migrations: migrations
 auth:
   provider: none
 mail:
   enabled: false
 storage:
   provider: r2
-  jurisdiction: us
+  jurisdiction: eu
   public: false
+functions:
+  crons:
+    - "*/5 * * * *"

@@ -1,10 +1,24 @@
-import { StorageUnavailableError, type StorageRuntime } from './storage';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { AuthUnavailableError, clearSessionCookie, createSessionCookie, hasSession, validAccessCode, validViewerToken, viewerToken, type AuthConfig } from './auth';
+import { DatabaseUnavailableError } from './repository';
+import { fixedLengthBody, StorageUnavailableError, type StorageRuntime } from './storage';
+import type { MarkdownService, MarkdownView, RecordingRow, Repository } from './types';
 
 export const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
 export const MAX_DURATION_SECONDS = 15 * 60;
-const MAX_JSON_BYTES = 8 * 1024;
+const MAX_JSON_BYTES = 24 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VIDEO_TYPES = new Set(['video/webm', 'video/mp4']);
+
+type Resolvable<T> = T | (() => T);
+export interface ApiOptions {
+  repository: Resolvable<Repository>;
+  auth: Resolvable<AuthConfig>;
+  markdown?: Resolvable<MarkdownService>;
+  now?: () => Date;
+  randomUUID?: () => string;
+  storageDiagnostics?: () => unknown;
+}
 
 export interface RecordingMetadata {
   id: string;
@@ -15,6 +29,9 @@ export interface RecordingMetadata {
   createdAt: string;
   videoUrl: string;
   sharePath: string;
+  isOwner: boolean;
+  protected: boolean;
+  markdownEnabled: boolean;
 }
 
 interface UploadInput {
@@ -25,32 +42,13 @@ interface UploadInput {
   durationSeconds: number;
 }
 
-interface PendingUpload {
-  version: 1;
-  uploadId: string;
-  transferId: string;
-  recording: RecordingMetadata;
-}
-
-interface ApiOptions {
-  now?: () => Date;
-  randomUUID?: () => string;
-  storageDiagnostics?: () => unknown;
-}
-
 class ApiError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
-    super(message);
-  }
+  constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 
-const objectKey = (id: string) => `recordings/${id}/video`;
-const metadataKey = (id: string) => `recordings/${id}/metadata.json`;
-const pendingKey = (uploadId: string) => `pending/${uploadId}.json`;
-const requestKey = (requestId: string) => `requests/${requestId}.json`;
+function resolve<T>(value: Resolvable<T>): T { return typeof value === 'function' ? (value as () => T)() : value; }
 
-export function createApiHandler(runtime: StorageRuntime | (() => StorageRuntime), options: ApiOptions = {}) {
-  const getRuntime = () => typeof runtime === 'function' ? runtime() : runtime;
+export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: ApiOptions) {
   const randomUUID = options.randomUUID ?? (() => crypto.randomUUID());
   const now = options.now ?? (() => new Date());
 
@@ -59,332 +57,390 @@ export function createApiHandler(runtime: StorageRuntime | (() => StorageRuntime
       const url = new URL(request.url);
       if (url.pathname === '/api/config' && request.method === 'GET') {
         let configured = true;
-        try { getRuntime(); } catch { configured = false; }
-        return json({
-          maxBytes: MAX_VIDEO_BYTES,
-          maxDurationSeconds: MAX_DURATION_SECONDS,
-          configured,
-          ...(options.storageDiagnostics ? { storage: options.storageDiagnostics() } : {}),
-        });
+        try { resolve(runtime); resolve(options.repository); resolve(options.auth); } catch { configured = false; }
+        return json({ maxBytes: MAX_VIDEO_BYTES, maxDurationSeconds: MAX_DURATION_SECONDS, configured });
+      }
+      const auth = resolve(options.auth);
+      const owner = await hasSession(request, auth, now());
+
+      if (url.pathname === '/api/session') {
+        if (request.method === 'GET') return json({ authenticated: owner });
+        assertSameOrigin(request);
+        if (request.method === 'DELETE') return json({ authenticated: false }, 200, { 'set-cookie': clearSessionCookie(request) });
+        requireMethod(request, 'POST');
+        const input = await readRequestJson(request);
+        if (!isObject(input) || !(await validAccessCode(auth, input.accessCode))) {
+          throw new ApiError(401, 'invalid_access_code', 'That access code is not correct.');
+        }
+        return json({ authenticated: true }, 200, { 'set-cookie': await createSessionCookie(request, auth, now()) });
       }
 
+      const repository = resolve(options.repository);
       if (url.pathname === '/api/recordings/uploads') {
         requireMethod(request, 'POST');
-        assertSameOrigin(request);
+        assertWrite(request, owner);
         const input = parseUploadInput(await readRequestJson(request));
-        const active = getRuntime();
-        let pending: PendingUpload;
-
-        const previous = input.requestId ? await readJsonObject(active, requestKey(input.requestId)) : null;
-        if (previous) {
-          if (!isObject(previous) || !isUuid(previous.uploadId)) throw invalidStoredObject();
-          const existing = await readJsonObject(active, pendingKey(previous.uploadId));
-          pending = parsePending(existing);
-          if (!sameInput(input, pending.recording)) {
-            throw new ApiError(409, 'upload_request_conflict', 'This upload request was already used for a different recording.');
-          }
-        } else {
-          const id = randomUUID();
-          const uploadId = randomUUID();
-          const reservation = await active.storage.reserveUpload({
-            idempotencyKey: `video:${uploadId}`,
-            objectKey: objectKey(id),
-            contentType: input.contentType,
-            contentLength: input.sizeBytes,
-          });
-          pending = {
-            version: 1,
-            uploadId,
-            transferId: reservation.transferId,
-            recording: {
-              id,
-              title: input.title,
-              contentType: input.contentType,
-              sizeBytes: input.sizeBytes,
-              durationSeconds: input.durationSeconds,
-              createdAt: now().toISOString(),
-              videoUrl: `/api/recordings/${id}/video`,
-              sharePath: `/v/${id}`,
-            },
-          };
-          await writeJsonObject(active, pendingKey(uploadId), pending, `pending:${uploadId}`);
-          if (input.requestId) {
-            await writeJsonObject(active, requestKey(input.requestId), { uploadId }, `request:${input.requestId}`);
-          }
-          return reservationResponse(pending, reservation);
-        }
-
-        const reservation = await active.storage.reserveUpload({
-          idempotencyKey: `video:${pending.uploadId}`,
-          objectKey: objectKey(pending.recording.id),
-          contentType: pending.recording.contentType,
-          contentLength: pending.recording.sizeBytes,
+        const id = randomUUID();
+        let recording = await repository.createRecording({
+          id, requestId: input.requestId ?? randomUUID(), uploadId: randomUUID(), title: input.title,
+          contentType: input.contentType, sizeBytes: input.sizeBytes, durationSeconds: input.durationSeconds,
+          createdAt: now().toISOString(), objectKey: `recordings/${id}/video`, transferId: null, uploadSha256: null, uploadAttempted: false,
+          uploadState: 'pending', protected: false, markdownEnabled: false,
         });
-        return reservationResponse(pending, reservation);
+        if (!sameInput(input, recording)) throw new ApiError(409, 'upload_request_conflict', 'This upload request was already used for a different recording.');
+        if (recording.uploadState === 'ready' || recording.uploadSha256) return reservationResponse(recording, true);
+        const reserved = await reserve(resolve(runtime), recording);
+        recording = await repository.attachTransfer(recording.id, reserved.transferId);
+        return reservationResponse(recording, reserved.state === 'completed');
       }
 
-      const route = /^\/api\/recordings\/([^/]+)(?:\/(complete|video))?$/.exec(url.pathname);
-      if (!route || !isUuid(route[1])) {
-        throw new ApiError(404, 'not_found', 'This recording could not be found.');
-      }
+      const route = /^\/api\/recordings\/([^/]+)(?:\/(upload|complete|video|markdown)(?:\/(download))?)?$/.exec(url.pathname);
+      if (!route || !isUuid(route[1]) || (route[3] && route[2] !== 'markdown')) throw notFound();
       const id = route[1].toLowerCase();
       const action = route[2];
+      let recording = await repository.getRecording(id);
 
-      if (action === 'complete') {
-        requireMethod(request, 'POST');
-        assertSameOrigin(request);
-        const input = await readRequestJson(request);
-        if (!isObject(input) || !isUuid(input.uploadId)) {
-          throw new ApiError(400, 'invalid_upload', 'A valid upload token is required.');
+      if (action === 'upload' || action === 'complete') {
+        requireMethod(request, action === 'upload' ? 'PUT' : 'POST');
+        assertWrite(request, owner);
+        let uploadId: unknown = url.searchParams.get('uploadId');
+        if (action === 'complete') {
+          const input = await readRequestJson(request);
+          uploadId = isObject(input) ? input.uploadId : null;
         }
-        const active = getRuntime();
-        const rawPending = await readJsonObject(active, pendingKey(input.uploadId.toLowerCase()));
-        if (rawPending === null) throw new ApiError(404, 'upload_not_found', 'This upload could not be found.');
-        const pending = parsePending(rawPending);
-        if (pending.recording.id !== id || pending.uploadId !== input.uploadId.toLowerCase()) {
-          throw new ApiError(404, 'upload_not_found', 'This upload could not be found.');
+        if (!isUuid(uploadId)) throw new ApiError(400, 'invalid_upload', 'A valid upload token is required.');
+        if (!recording || recording.uploadId !== uploadId.toLowerCase()) throw new ApiError(404, 'upload_not_found', 'This upload could not be found.');
+        if (action === 'upload') {
+          return await uploadVideo(request, resolve(runtime), repository, recording);
         }
-
-        const existing = await readJsonObject(active, metadataKey(id));
-        if (existing !== null) return json(parseRecording(existing, id));
-
-        const completion = await active.storage.completeUpload(pending.transferId);
-        if (completion.state !== 'completed') {
-          return json({ state: 'pending', retryAfterSeconds: 2 }, 202, { 'retry-after': '2' });
+        if (recording.uploadState !== 'ready') {
+          if (!recording.transferId) return pendingResponse();
+          const transferId = recording.transferId;
+          if (!recording.uploadSha256) {
+            const owner = crypto.randomUUID();
+            const claimed = await repository.claimUpload(recording.id, owner);
+            if (!claimed) return pendingResponse();
+            try {
+              // Signed reads are granted only after the gateway has registered its receipt.
+              if (!claimed.uploadSha256 && (await resolve(runtime).storage.completeUpload(transferId)).state !== 'completed') return pendingResponse();
+              const digest = claimed.uploadSha256 ?? await storedVideoDigest(resolve(runtime), claimed);
+              if (!digest) return pendingResponse();
+              const saved = await repository.saveUploadDigest(recording.id, owner, digest);
+              if (!saved) return pendingResponse();
+              recording = saved;
+            } finally { await repository.releaseUpload(recording.id, owner); }
+          }
+          const completion = await resolve(runtime).storage.completeUpload(transferId);
+          if (completion.state !== 'completed') return pendingResponse();
+          recording = await repository.completeRecording(id);
         }
-        await writeJsonObject(active, metadataKey(id), pending.recording, `publish:${pending.uploadId}`);
-        return json(pending.recording);
+        return json(await metadata(recording, true, auth, null));
       }
 
+      if (!recording || recording.uploadState !== 'ready') throw notFound();
+      if (!action && request.method === 'PATCH') {
+        assertWrite(request, owner);
+        const input = await readRequestJson(request);
+        if (!isObject(input) || !Object.keys(input).length || Object.keys(input).some(key => key !== 'protected' && key !== 'markdownEnabled') ||
+          (input.protected !== undefined && typeof input.protected !== 'boolean') || (input.markdownEnabled !== undefined && typeof input.markdownEnabled !== 'boolean')) {
+          throw new ApiError(400, 'invalid_settings', 'Choose a valid sharing option.');
+        }
+        recording = await repository.updateRecording(id, input as { protected?: boolean; markdownEnabled?: boolean });
+        return json(await metadata(recording, true, auth, null));
+      }
+
+      if (action === 'markdown' && request.method === 'POST' && !route[3]) {
+        assertWrite(request, owner);
+        const input = await readRequestJson(request);
+        if (!isObject(input) || typeof input.goal !== 'string' || input.goal.length > 4000 || !isUuid(input.requestId)) {
+          throw new ApiError(400, 'invalid_goal', 'Use a goal of 4,000 characters or fewer and a valid request ID.');
+        }
+        if (!recording.markdownEnabled) throw new ApiError(409, 'markdown_disabled', 'Turn on Generate Markdown first.');
+        if (!options.markdown) throw new ApiError(503, 'markdown_unavailable', 'Markdown generation is not connected yet.');
+        return json(await resolve(options.markdown).generate(recording, input.goal.trim(), input.requestId.toLowerCase()), 202);
+      }
+
+      if (!owner && recording.protected && !(await validViewerToken(auth, id, url.searchParams.get('token')))) {
+        throw new ApiError(403, 'access_denied', 'This recording needs its complete protected link.');
+      }
       if (action === 'video') {
         if (request.method !== 'GET' && request.method !== 'HEAD') requireMethod(request, 'GET');
-        const active = getRuntime();
-        const metadata = await getRecording(active, id);
-        return await streamVideo(request, active, metadata);
+        return await streamVideo(request, resolve(runtime), recording);
       }
-
+      if (action === 'markdown') {
+        requireMethod(request, 'GET');
+        if (!recording.markdownEnabled && !owner) {
+          if (route[3]) throw notFound();
+          return json({ enabled: false, status: 'idle', markdown: null } satisfies MarkdownView);
+        }
+        const view = options.markdown
+          ? await resolve(options.markdown).status(recording, true)
+          : await storedMarkdown(repository, recording);
+        if (route[3]) {
+          if (!view.markdown) throw new ApiError(404, 'markdown_not_ready', 'Markdown is not ready yet.');
+          const headers = commonHeaders();
+          headers.set('content-type', 'text/markdown; charset=utf-8');
+          headers.set('content-disposition', `attachment; filename="slop-rooster-${id}.md"`);
+          return new Response(view.markdown, { headers });
+        }
+        return json(view);
+      }
       requireMethod(request, 'GET');
-      return json(await getRecording(getRuntime(), id));
+      return json(await metadata(recording, owner, auth, url.searchParams.get('token')));
     } catch (error) {
       if (error instanceof ApiError) return json({ error: error.message, code: error.code }, error.status);
-      if (error instanceof StorageUnavailableError) {
-        return json({ error: 'Storage is not connected yet. Please try again later.', code: 'storage_unavailable' }, 503);
-      }
+      if (error instanceof AuthUnavailableError) return json({ error: 'Access is not configured yet. Please try again later.', code: 'auth_unavailable' }, 503);
+      if (error instanceof DatabaseUnavailableError) return json({ error: 'The database is not connected yet. Please try again later.', code: 'database_unavailable' }, 503);
+      if (error instanceof StorageUnavailableError) return json({ error: 'Storage is not connected yet. Please try again later.', code: 'storage_unavailable' }, 503);
       const code = errorCode(error);
-      if (code === 'storage_quota_exceeded') {
-        return json({ error: 'Storage is full. Your recording has not been shared.', code }, 507);
-      }
-      if (code === 'storage_upload_expired') {
-        return json({ error: 'This upload expired. Please upload your recording again.', code }, 409);
-      }
-      return json({ error: 'Storage could not finish this request. Please try again.', code: 'storage_error' }, 502);
+      if (code === 'storage_quota_exceeded') return json({ error: 'Storage is full. Your recording has not been shared.', code }, 507);
+      if (code === 'storage_upload_expired') return json({ error: 'This upload expired. Please upload your recording again.', code }, 409);
+      if (code === 'request_conflict') return json({ error: 'This generation request was already used with a different goal.', code }, 409);
+      if (code === 'generation_busy') return json({ error: 'A generation is already being started. Please retry.', code }, 409);
+      return json({ error: 'This request could not be completed. Please try again.', code: 'request_failed' }, 502);
     }
   };
 }
 
-function reservationResponse(pending: PendingUpload, reservation: Awaited<ReturnType<StorageRuntime['storage']['reserveUpload']>>) {
-  return json({
-    id: pending.recording.id,
-    uploadId: pending.uploadId,
-    uploadUrl: reservation.state === 'ready' ? reservation.capability.url : null,
-    headers: reservation.state === 'ready' ? reservation.capability.requiredHeaders : {},
-    alreadyUploaded: reservation.state === 'completed',
-  }, 201);
+async function metadata(recording: RecordingRow, isOwner: boolean, auth: AuthConfig, suppliedToken: string | null): Promise<RecordingMetadata> {
+  const token = recording.protected ? (isOwner ? await viewerToken(auth, recording.id) : suppliedToken) : null;
+  const query = token ? `?token=${encodeURIComponent(token)}` : '';
+  return {
+    id: recording.id, title: recording.title, durationSeconds: recording.durationSeconds, sizeBytes: recording.sizeBytes,
+    contentType: recording.contentType, createdAt: recording.createdAt, isOwner, protected: recording.protected,
+    markdownEnabled: recording.markdownEnabled, videoUrl: `/api/recordings/${recording.id}/video${query}`, sharePath: `/v/${recording.id}${query}`,
+  };
 }
 
-async function getRecording(runtime: StorageRuntime, id: string): Promise<RecordingMetadata> {
-  const raw = await readJsonObject(runtime, metadataKey(id));
-  if (raw === null) throw new ApiError(404, 'not_found', 'This recording could not be found.');
-  return parseRecording(raw, id);
+function reserve(runtime: StorageRuntime, recording: RecordingRow) {
+  return runtime.storage.reserveUpload({ idempotencyKey: `video:${recording.uploadId}`, objectKey: recording.objectKey, contentType: recording.contentType, contentLength: recording.sizeBytes });
 }
 
-async function streamVideo(request: Request, runtime: StorageRuntime, metadata: RecordingMetadata) {
-  const capability = await runtime.storage.createSignedRead(objectKey(metadata.id));
-  const headers = new Headers(capability.requiredHeaders);
+function reservationResponse(recording: RecordingRow, alreadyUploaded: boolean) {
+  return json({ id: recording.id, uploadId: recording.uploadId,
+    uploadUrl: alreadyUploaded ? null : `/api/recordings/${recording.id}/upload?uploadId=${recording.uploadId}`,
+    headers: { 'content-type': recording.contentType }, alreadyUploaded }, 201);
+}
+
+function pendingResponse() { return json({ state: 'pending', retryAfterSeconds: 2 }, 202, { 'retry-after': '2' }); }
+
+function digestHex(bytes: Uint8Array) { return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(''); }
+
+function lengthError() { return new ApiError(400, 'upload_size_mismatch', 'The upload size does not match this recording.'); }
+function replayConflict() { return new ApiError(409, 'upload_content_conflict', 'This upload already contains a different recording.'); }
+
+/** A constant-memory hash: each chunk is discarded as soon as SHA-256 consumes it. */
+async function hashBody(body: ReadableStream<Uint8Array>, expected: number, signal?: AbortSignal): Promise<string> {
+  const hash = sha256.create();
+  const reader = body.getReader();
+  let length = 0;
+  const cancel = () => { void reader.cancel().catch(() => undefined); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new ApiError(408, 'upload_timeout', 'The upload timed out. Please try again.');
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      length += chunk.value.byteLength;
+      if (length > expected || length > MAX_VIDEO_BYTES) { await reader.cancel(); throw lengthError(); }
+      hash.update(chunk.value);
+    }
+    if (signal?.aborted) throw new ApiError(408, 'upload_timeout', 'The upload timed out. Please try again.');
+    if (length !== expected) throw lengthError();
+    return digestHex(hash.digest());
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    reader.releaseLock();
+    hash.destroy();
+  }
+}
+
+async function storedVideoDigest(runtime: StorageRuntime, recording: RecordingRow, signal?: AbortSignal): Promise<string | null> {
+  let capability;
+  try { capability = await runtime.storage.createSignedRead(recording.objectKey); }
+  catch (error) { if (errorCode(error) === 'storage_object_not_found') return null; throw error; }
+  const response = await runtime.capabilityFetch(new Request(capability.url, { headers: capability.requiredHeaders, redirect: 'error', signal }));
+  if (response.status === 404) { await response.body?.cancel(); return null; }
+  if (!response.ok || !response.body) { await response.body?.cancel(); throw new ApiError(502, 'video_unavailable', 'The uploaded recording could not be verified.'); }
+  try { return await hashBody(response.body, recording.sizeBytes, signal); }
+  catch (error) {
+    if (error instanceof ApiError && error.code === 'upload_size_mismatch') throw new ApiError(502, 'stored_video_invalid', 'The uploaded recording could not be verified.');
+    throw error;
+  }
+}
+
+async function uploadVideo(request: Request, runtime: StorageRuntime, repository: Repository, recording: RecordingRow) {
+  const type = request.headers.get('content-type')?.split(';')[0].trim();
+  if (type !== recording.contentType) throw new ApiError(415, 'invalid_video_type', 'The upload type does not match this recording.');
+  const declared = request.headers.get('content-length');
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) !== recording.sizeBytes)) throw lengthError();
+  if (!request.body) throw new ApiError(400, 'empty_upload', 'The recording must contain video data.');
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  const timeout = setTimeout(cancel, 120_000);
+  request.signal.addEventListener('abort', cancel, { once: true });
+  let leaseOwner: string | null = null;
+  try {
+    if (request.signal.aborted) controller.abort();
+    if (recording.uploadSha256) {
+      if (await hashBody(request.body, recording.sizeBytes, controller.signal) !== recording.uploadSha256) throw replayConflict();
+      return new Response(null, { status: 204, headers: commonHeaders() });
+    }
+    // Only one first PUT may be in flight. Its 120-second request deadline is shorter
+    // than the durable 180-second lease, including when an invocation disappears.
+    leaseOwner = crypto.randomUUID();
+    const claimed = await repository.claimUpload(recording.id, leaseOwner);
+    if (!claimed) throw new ApiError(409, 'upload_in_progress', 'This upload is already in progress. Please retry in a moment.');
+    recording = claimed;
+    let storedDigest = recording.uploadSha256;
+    if (!storedDigest && (recording.uploadAttempted || recording.uploadState === 'ready')) {
+      if (!recording.transferId) throw new ApiError(502, 'upload_unavailable', 'The original upload could not be verified.');
+      const outcome = await runtime.storage.completeUpload(recording.transferId);
+      if (outcome.state !== 'completed') throw new ApiError(503, 'upload_outcome_pending', 'Storage is still verifying the original upload. Please retry in a moment.');
+      storedDigest = await storedVideoDigest(runtime, recording, controller.signal);
+      if (!storedDigest) throw new ApiError(502, 'video_unavailable', 'The uploaded recording could not be verified.');
+    }
+    if (storedDigest) {
+      // The first PUT may have committed even if its response or DB checkpoint was lost.
+      // Confirm the original bytes instead of issuing a second PUT to its object key.
+      if (!await repository.saveUploadDigest(recording.id, leaseOwner, storedDigest)) throw new ApiError(409, 'upload_in_progress', 'This upload is still being verified. Please retry.');
+      if (await hashBody(request.body, recording.sizeBytes, controller.signal) !== storedDigest) throw replayConflict();
+      return new Response(null, { status: 204, headers: commonHeaders() });
+    }
+    if (recording.uploadState === 'ready') throw new ApiError(502, 'video_unavailable', 'The uploaded recording could not be verified.');
+    const reserved = await reserve(runtime, recording);
+    await repository.attachTransfer(recording.id, reserved.transferId);
+    if (reserved.state === 'completed') throw new ApiError(502, 'video_unavailable', 'The uploaded recording could not be verified.');
+    const hash = sha256.create();
+    let length = 0;
+    let forwarded = 0;
+    let invalidLength = false;
+    let digest: string | null = null;
+    const body = request.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        length += chunk.byteLength;
+        if (length > recording.sizeBytes || length > MAX_VIDEO_BYTES) { invalidLength = true; throw lengthError(); }
+        hash.update(chunk);
+        forwarded += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (length !== recording.sizeBytes) { invalidLength = true; throw lengthError(); }
+        digest = digestHex(hash.digest());
+      },
+    }));
+    const headers = new Headers(reserved.capability.requiredHeaders);
+    headers.set('content-type', recording.contentType);
+    headers.set('content-length', String(recording.sizeBytes));
+    let upstream: Response;
+    try {
+      if (!await repository.markUploadAttempt(recording.id, leaseOwner, true)) throw new ApiError(409, 'upload_in_progress', 'This upload is still being verified. Please retry.');
+      upstream = await runtime.capabilityFetch(new Request(reserved.capability.url, {
+        method: 'PUT', headers, body: fixedLengthBody(body, recording.sizeBytes), redirect: 'error', signal: controller.signal, duplex: 'half',
+      } as RequestInit));
+    } catch (error) {
+      if (invalidLength) {
+        // Too few bytes could not commit a fixed-length object. A full-length PUT
+        // followed by extra input has an uncertain outcome and must be reconciled.
+        if (forwarded < recording.sizeBytes) await repository.markUploadAttempt(recording.id, leaseOwner, false);
+        throw lengthError();
+      }
+      if (controller.signal.aborted) throw new ApiError(408, 'upload_timeout', 'The upload timed out. Please try again.');
+      throw error;
+    } finally { hash.destroy(); }
+    await upstream.body?.cancel();
+    if (!upstream.ok) {
+      if (upstream.status >= 400 && upstream.status < 500) await repository.markUploadAttempt(recording.id, leaseOwner, false);
+      if (invalidLength || !digest) throw lengthError();
+      throw new ApiError(502, 'upload_failed', 'The video could not be uploaded. Please try again.');
+    }
+    if (invalidLength || !digest) throw lengthError();
+    if (!await repository.saveUploadDigest(recording.id, leaseOwner, digest)) throw new ApiError(409, 'upload_in_progress', 'This upload is still being verified. Please retry.');
+    return new Response(null, { status: 204, headers: commonHeaders() });
+  } finally {
+    clearTimeout(timeout);
+    request.signal.removeEventListener('abort', cancel);
+    if (leaseOwner) await repository.releaseUpload(recording.id, leaseOwner);
+  }
+}
+
+async function streamVideo(request: Request, runtime: StorageRuntime, recording: RecordingRow) {
+  const headers = new Headers();
   const range = request.headers.get('range');
   if (range) {
-    if (range.length > 80 || !/^bytes=(?:\d+-\d*|-\d+)$/.test(range)) {
-      throw new ApiError(416, 'invalid_range', 'Only one valid video byte range can be requested.');
-    }
+    if (range.length > 80 || !/^bytes=(?:\d+-\d*|-\d+)$/.test(range)) throw new ApiError(416, 'invalid_range', 'Only one valid video byte range can be requested.');
     headers.set('range', range);
   }
   const ifRange = request.headers.get('if-range');
   if (ifRange && ifRange.length <= 256) headers.set('if-range', ifRange);
-  const upstream = await runtime.capabilityFetch(new Request(capability.url, { method: 'GET', headers }));
-  if (![200, 206, 416].includes(upstream.status)) {
-    await upstream.body?.cancel();
-    throw new ApiError(502, 'video_unavailable', 'The recording could not be loaded. Please try again.');
-  }
+  const capability = await runtime.storage.createSignedRead(recording.objectKey);
+  for (const [name, value] of Object.entries(capability.requiredHeaders)) headers.set(name, value);
+  const upstream = await runtime.capabilityFetch(new Request(capability.url, { method: 'GET', headers, redirect: 'error' }));
+  if (![200, 206, 416].includes(upstream.status)) { await upstream.body?.cancel(); throw new ApiError(502, 'video_unavailable', 'The recording could not be loaded. Please try again.'); }
   const responseHeaders = commonHeaders();
-  responseHeaders.set('content-type', metadata.contentType);
+  responseHeaders.set('content-type', recording.contentType);
   responseHeaders.set('content-disposition', 'inline');
-  responseHeaders.set('cache-control', 'private, max-age=60');
   for (const name of ['content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
     const value = upstream.headers.get(name);
     if (value !== null) responseHeaders.set(name, value);
   }
-  if (request.method === 'HEAD') {
-    await upstream.body?.cancel();
-    return new Response(null, { status: upstream.status, headers: responseHeaders });
-  }
+  if (request.method === 'HEAD') { await upstream.body?.cancel(); return new Response(null, { status: upstream.status, headers: responseHeaders }); }
   return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
 }
 
-async function readJsonObject(runtime: StorageRuntime, key: string): Promise<unknown | null> {
-  let capability;
-  try { capability = await runtime.storage.createSignedRead(key); }
-  catch (error) {
-    if (errorCode(error) === 'storage_object_not_found') return null;
-    throw error;
-  }
-  const response = await runtime.capabilityFetch(new Request(capability.url, { headers: capability.requiredHeaders }));
-  if (response.status === 404) {
-    await response.body?.cancel();
-    return null;
-  }
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw invalidStoredObject();
-  }
-  try { return JSON.parse(await readBoundedText(response, MAX_JSON_BYTES)); }
-  catch { throw invalidStoredObject(); }
-}
-
-async function writeJsonObject(runtime: StorageRuntime, key: string, value: unknown, idempotencyKey: string) {
-  const uploaded = await runtime.storage.upload({
-    objectKey: key,
-    idempotencyKey,
-    contentType: 'application/json',
-    bytes: new TextEncoder().encode(JSON.stringify(value)),
-  });
-  if (uploaded.state === 'completed') return;
-  const completion = await runtime.storage.completeUpload(uploaded.transferId);
-  if (completion.state !== 'completed') {
-    throw new ApiError(503, 'storage_pending', 'Storage is still saving this recording. Please retry in a moment.');
-  }
+async function storedMarkdown(repository: Repository, recording: RecordingRow): Promise<MarkdownView> {
+  const job = await repository.getLatestJob(recording.id);
+  return { enabled: recording.markdownEnabled, status: job?.status ?? 'idle', markdown: job?.markdown ?? null, ...(job ? { jobId: job.id } : {}), ...(job?.error ? { error: job.error } : {}) };
 }
 
 async function readRequestJson(request: Request): Promise<unknown> {
-  if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) {
-    throw new ApiError(415, 'unsupported_content_type', 'Send this request as JSON.');
-  }
-  try { return JSON.parse(await readBoundedText(request, MAX_JSON_BYTES)); }
-  catch (error) {
-    if (error instanceof ApiError) throw error;
-    throw new ApiError(400, 'invalid_json', 'This request contains invalid JSON.');
-  }
+  if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new ApiError(415, 'unsupported_content_type', 'Send this request as JSON.');
+  try { return JSON.parse(await readBoundedText(request)); }
+  catch (error) { if (error instanceof ApiError) throw error; throw new ApiError(400, 'invalid_json', 'This request contains invalid JSON.'); }
 }
 
-async function readBoundedText(source: Request | Response, maximumBytes: number) {
-  const declaredLength = source.headers.get('content-length');
-  if (declaredLength && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maximumBytes)) {
-    throw new ApiError(413, 'request_too_large', 'This request is too large.');
-  }
-  if (!source.body) return '';
-  const reader = source.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
+async function readBoundedText(request: Request) {
+  const declaredLength = request.headers.get('content-length');
+  if (declaredLength && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > MAX_JSON_BYTES)) throw new ApiError(413, 'request_too_large', 'This request is too large.');
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let length = 0, text = '';
   try {
     for (;;) {
       const result = await reader.read();
       if (result.done) break;
       length += result.value.byteLength;
-      if (length > maximumBytes) {
-        await reader.cancel();
-        throw new ApiError(413, 'request_too_large', 'This request is too large.');
-      }
-      chunks.push(result.value);
+      if (length > MAX_JSON_BYTES) { await reader.cancel(); throw new ApiError(413, 'request_too_large', 'This request is too large.'); }
+      text += decoder.decode(result.value, { stream: true });
     }
+    return text + decoder.decode();
   } finally { reader.releaseLock(); }
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 function parseUploadInput(value: unknown): UploadInput {
   if (!isObject(value)) throw new ApiError(400, 'invalid_recording', 'Recording details are required.');
-  if (value.id !== undefined && !isUuid(value.id)) {
-    throw new ApiError(400, 'invalid_request_id', 'A valid upload request ID is required.');
-  }
-  if (typeof value.title !== 'string' || !value.title.trim() || value.title.trim().length > 100 || /[\u0000-\u001f\u007f]/.test(value.title)) {
-    throw new ApiError(400, 'invalid_title', 'Use a recording title between 1 and 100 characters.');
-  }
-  if (typeof value.contentType !== 'string' || !VIDEO_TYPES.has(value.contentType)) {
-    throw new ApiError(415, 'invalid_video_type', 'Only WebM and MP4 recordings are supported.');
-  }
-  if (!Number.isSafeInteger(value.sizeBytes) || Number(value.sizeBytes) < 1) {
-    throw new ApiError(400, 'invalid_size', 'The recording must contain video data.');
-  }
-  if (Number(value.sizeBytes) > MAX_VIDEO_BYTES) {
-    throw new ApiError(413, 'recording_too_large', 'Recordings must be 50 MB or smaller.');
-  }
-  if (typeof value.durationSeconds !== 'number' || !Number.isFinite(value.durationSeconds) || value.durationSeconds < 0 || value.durationSeconds > MAX_DURATION_SECONDS) {
-    throw new ApiError(400, 'invalid_duration', 'Recordings must be 15 minutes or shorter.');
-  }
-  return {
-    ...(value.id ? { requestId: String(value.id).toLowerCase() } : {}),
-    title: value.title.trim(),
-    contentType: value.contentType,
-    sizeBytes: Number(value.sizeBytes),
-    durationSeconds: value.durationSeconds,
-  };
+  if (value.id !== undefined && !isUuid(value.id)) throw new ApiError(400, 'invalid_request_id', 'A valid upload request ID is required.');
+  if (typeof value.title !== 'string' || !value.title.trim() || value.title.trim().length > 100 || /[\u0000-\u001f\u007f]/.test(value.title)) throw new ApiError(400, 'invalid_title', 'Use a recording title between 1 and 100 characters.');
+  if (typeof value.contentType !== 'string' || !VIDEO_TYPES.has(value.contentType)) throw new ApiError(415, 'invalid_video_type', 'Only WebM and MP4 recordings are supported.');
+  if (!Number.isSafeInteger(value.sizeBytes) || Number(value.sizeBytes) < 1) throw new ApiError(400, 'invalid_size', 'The recording must contain video data.');
+  if (Number(value.sizeBytes) > MAX_VIDEO_BYTES) throw new ApiError(413, 'recording_too_large', 'Recordings must be 50 MB or smaller.');
+  if (typeof value.durationSeconds !== 'number' || !Number.isFinite(value.durationSeconds) || value.durationSeconds < 0 || value.durationSeconds > MAX_DURATION_SECONDS) throw new ApiError(400, 'invalid_duration', 'Recordings must be 15 minutes or shorter.');
+  return { ...(value.id ? { requestId: String(value.id).toLowerCase() } : {}), title: value.title.trim(), contentType: value.contentType, sizeBytes: Number(value.sizeBytes), durationSeconds: value.durationSeconds };
 }
 
-function parsePending(value: unknown): PendingUpload {
-  if (!isObject(value) || value.version !== 1 || !isUuid(value.uploadId) ||
-      typeof value.transferId !== 'string' || value.transferId.length < 1 || value.transferId.length > 128 ||
-      !isObject(value.recording) || !isUuid(value.recording.id)) throw invalidStoredObject();
-  return { version: 1, uploadId: value.uploadId, transferId: value.transferId, recording: parseRecording(value.recording, value.recording.id) };
-}
-
-function parseRecording(value: unknown, id: string): RecordingMetadata {
-  if (!isObject(value) || value.id !== id || !isUuid(value.id) ||
-      typeof value.title !== 'string' || !value.title || value.title.length > 100 ||
-      typeof value.durationSeconds !== 'number' || !Number.isFinite(value.durationSeconds) || value.durationSeconds < 0 || value.durationSeconds > MAX_DURATION_SECONDS ||
-      !Number.isSafeInteger(value.sizeBytes) || Number(value.sizeBytes) < 1 || Number(value.sizeBytes) > MAX_VIDEO_BYTES ||
-      typeof value.contentType !== 'string' || !VIDEO_TYPES.has(value.contentType) ||
-      typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) ||
-      value.videoUrl !== `/api/recordings/${id}/video` || value.sharePath !== `/v/${id}`) throw invalidStoredObject();
-  return {
-    id, title: value.title, durationSeconds: value.durationSeconds, sizeBytes: Number(value.sizeBytes),
-    contentType: value.contentType, createdAt: value.createdAt, videoUrl: value.videoUrl, sharePath: value.sharePath,
-  };
-}
-
-function sameInput(input: UploadInput, recording: RecordingMetadata) {
-  return input.title === recording.title && input.contentType === recording.contentType &&
-    input.sizeBytes === recording.sizeBytes && input.durationSeconds === recording.durationSeconds;
-}
-
+function sameInput(input: UploadInput, recording: RecordingRow) { return input.title === recording.title && input.contentType === recording.contentType && input.sizeBytes === recording.sizeBytes && input.durationSeconds === recording.durationSeconds; }
+function assertWrite(request: Request, owner: boolean) { assertSameOrigin(request); if (!owner) throw new ApiError(401, 'authentication_required', 'Enter your access code to continue.'); }
 function assertSameOrigin(request: Request) {
   const origin = request.headers.get('origin');
-  if ((origin !== null && origin !== new URL(request.url).origin) || request.headers.get('sec-fetch-site') === 'cross-site') {
-    throw new ApiError(403, 'cross_origin_request', 'Upload recordings from this website.');
-  }
+  if ((origin !== null && origin !== new URL(request.url).origin) || request.headers.get('sec-fetch-site') === 'cross-site') throw new ApiError(403, 'cross_origin_request', 'Use this website to make changes.');
 }
-
-function requireMethod(request: Request, expected: string) {
-  if (request.method !== expected) throw new ApiError(405, 'method_not_allowed', `This endpoint accepts ${expected} requests.`);
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
+function requireMethod(request: Request, expected: string) { if (request.method !== expected) throw new ApiError(405, 'method_not_allowed', `This endpoint accepts ${expected} requests.`); }
+function isObject(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && UUID.test(value); }
 function errorCode(value: unknown) { return isObject(value) && typeof value.code === 'string' ? value.code : null; }
-function invalidStoredObject() { return new ApiError(502, 'invalid_storage_response', 'The recording could not be loaded. Please try again.'); }
-
-function commonHeaders() {
-  return new Headers({
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-    'x-robots-tag': 'noindex, nofollow',
-  });
-}
-
+function notFound() { return new ApiError(404, 'not_found', 'This recording could not be found.'); }
+function commonHeaders() { return new Headers({ 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex, nofollow' }); }
 function json(value: unknown, status = 200, extraHeaders?: Record<string, string>) {
   const headers = commonHeaders();
   headers.set('content-type', 'application/json; charset=utf-8');

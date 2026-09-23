@@ -13,7 +13,7 @@ function draw() {
   context.fillRect(120 + Math.sin(frame / 30) * 60, 160, 160, 160);
   context.fillStyle = '#222a30';
   context.font = 'bold 54px sans-serif';
-  context.fillText('Little Loom · recording test', 120, 430);
+  context.fillText('Slop Rooster · recording test', 120, 430);
   context.font = '28px sans-serif';
   context.fillText(`Real video frame ${frame++}`, 120, 490);
   requestAnimationFrame(draw);

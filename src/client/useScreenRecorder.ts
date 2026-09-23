@@ -70,7 +70,7 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
   const start = useCallback(async ({ microphone, systemAudio }: { microphone: boolean; systemAudio: boolean }) => {
     if (!['idle', 'preview'].includes(phaseRef.current)) return;
     if (!navigator.mediaDevices?.getDisplayMedia || typeof MediaRecorder === 'undefined') {
-      setError('Screen recording isn’t available in this browser. Open Little Loom in a recent desktop version of Chrome, Edge, or Firefox.');
+      setError('Screen recording isn’t available in this browser. Open Slop Rooster in a recent desktop version of Chrome, Edge, or Firefox.');
       return;
     }
     const version = ++captureVersion.current;
