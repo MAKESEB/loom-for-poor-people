@@ -29,7 +29,7 @@ type ButtonProps = React.ComponentProps<'button'> & VariantProps<typeof buttonVa
 
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ className, variant, size, asChild = false, ...props }, ref) => {
   const Component = asChild ? Slot : 'button';
-  return <Component data-slot="button" className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props} />;
+  return <Component data-slot="button" data-size={size ?? 'default'} className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props} />;
 });
 Button.displayName = 'Button';
 

@@ -94,10 +94,13 @@
 .audio-button { color: #a1a1aa; gap: 7px; font-size: 11px; font-weight: 400; padding-inline: 10px; }
 .audio-button.audio-enabled { color: #52525b; }
 .audio-button [data-slot='button'] > svg, .audio-button > svg { width: 14px; height: 14px; }
-.capture-actions { display: flex; align-items: center; gap: 8px; }
-.capture-actions > [data-slot='button'] { font-size: 11px; font-weight: 500; gap: 9px; border-radius: 6px; padding-inline: 15px; height: 37px; }
-.capture-actions > [data-slot='button']:has(> svg:only-child) { width: 37px; padding: 0; }
-.stop-icon { fill: currentColor; width: 11px !important; height: 11px !important; }
+.capture-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.capture-actions > [data-slot='button'] { font-size: 12px; font-weight: 500; gap: 9px; border-radius: 8px; padding-inline: 16px; height: 44px; }
+.capture-actions > [data-size='icon'] { width: 44px; padding: 0; }
+.capture-actions > .stop-recording-button { min-width: 158px; gap: 10px; background: #dc2626; color: #fff; border: 1px solid #dc2626; box-shadow: 0 1px 2px #991b1b18; }
+.capture-actions > .stop-recording-button:hover { background: #b91c1c; border-color: #b91c1c; }
+.capture-actions > .stop-recording-button:active { background: #991b1b; border-color: #991b1b; }
+.stop-icon { fill: currentColor; width: 12px !important; height: 12px !important; }
 .studio-caption { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; color: #a1a1aa; font-size: 10px; line-height: 1.6; }
 .studio-caption > span:first-child { display: flex; gap: 6px; align-items: center; }
 .recording-meta { display: inline-flex; align-items: center; gap: 7px; color: #8a8a93; font-size: 11px; line-height: 1.65; }
@@ -237,7 +240,8 @@
   .empty-stage { padding: 24px; }
   .audio-button { padding-inline: 7px; font-size: 10px; gap: 5px; }
   .recorder-toolbar { padding: 12px; min-height: 65px; }
-  .capture-actions > [data-slot='button'] { font-size: 10px; padding-inline: 12px; }
+  .capture-actions > [data-slot='button'] { font-size: 12px; padding-inline: 12px; }
+  .capture-actions > [data-size='icon'] { padding: 0; }
   .studio-caption { font-size: 9px; }
   .share-settings { margin-top: 28px; }
   .goal-editor { padding-left: 0; }
@@ -272,8 +276,8 @@
   .audio-controls { justify-content: center; gap: 14px; }
   .audio-button { font-size: 11px; height: 32px; }
   .capture-actions { width: 100%; }
-  .capture-actions > [data-slot='button'] { flex: 1; height: 39px; font-size: 11px; }
-  .capture-actions > [data-slot='button']:has(> svg:only-child) { flex: 0 0 39px; }
+  .capture-actions > [data-slot='button'] { flex: 1; height: 44px; font-size: 12px; }
+  .capture-actions > [data-size='icon'] { flex: 0 0 44px; }
   .studio-caption { margin-top: 13px; justify-content: center; font-size: 9px; }
   .studio-caption > span:last-child { display: none; }
   .recording-meta { font-size: 9px; flex-wrap: wrap; }
