@@ -335,9 +335,18 @@ async function uploadVideo(request: Request, runtime: StorageRuntime, repository
     let upstream: Response;
     try {
       if (!await repository.markUploadAttempt(recording.id, leaseOwner, true)) throw new ApiError(409, 'upload_in_progress', 'This upload is still being verified. Please retry.');
-      upstream = await runtime.capabilityFetch(new Request(reserved.capability.url, {
-        method: 'PUT', headers, body: fixedLengthBody(body, recording.sizeBytes), redirect: 'error', signal: controller.signal, duplex: 'half',
-      } as RequestInit));
+      let outgoing: Request;
+      try {
+        outgoing = new Request(reserved.capability.url, {
+          method: 'PUT', headers, body: fixedLengthBody(body, recording.sizeBytes), redirect: 'error', signal: controller.signal, duplex: 'half',
+        } as RequestInit);
+      } catch {
+        throw new ApiError(502, 'upload_request_invalid', 'The upload request could not be prepared. Please try again.');
+      }
+      try { upstream = await runtime.capabilityFetch(outgoing); }
+      catch {
+        throw new ApiError(502, 'storage_transfer_unavailable', 'Storage could not receive the upload. Please try again.');
+      }
     } catch (error) {
       if (invalidLength) {
         // Too few bytes could not commit a fixed-length object. A full-length PUT

@@ -9,6 +9,7 @@ runtime:
   egress:
     allow:
       - https://generativelanguage.googleapis.com
+      - https://9e753b729403274e3c62ea1ffd4fddd7.eu.r2.cloudflarestorage.com
 database:
   enabled: true
   migrations: migrations

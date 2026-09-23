@@ -364,3 +364,47 @@ test('storage configuration uses documented gateway values and sanitizes all fai
   const response = await broken(req('/api/recordings/uploads', { value: DETAILS }));
   assert.equal(response.status, 502); assert(!(await response.text()).includes('secret'));
 });
+
+test('upload diagnostics distinguish preparation and transport failures without exposing private error text', async t => {
+  const { handle, req, runtime, state, repository } = await setup(t);
+  const privateError = 'redaction-sentinel-46728 https://private-storage.test/object?signature=private-key';
+  const makeUpload = async () => (await handle(req('/api/recordings/uploads', { value: { ...DETAILS, id: crypto.randomUUID() } }))).json();
+  const put = (upload: { uploadUrl: string; headers: Record<string, string> }) => req(upload.uploadUrl, { method: 'PUT', body: VIDEO.slice().buffer, headers: upload.headers });
+  const scope = globalThis as typeof globalThis & { FixedLengthStream?: new (length: number) => TransformStream<Uint8Array, Uint8Array> };
+  const original = scope.FixedLengthStream;
+  const preparation = await makeUpload();
+  let response: Response;
+  try {
+    scope.FixedLengthStream = class extends TransformStream<Uint8Array, Uint8Array> {
+      constructor() { super(); throw new Error(privateError); }
+    };
+    response = await handle(put(preparation));
+  } finally {
+    if (original) scope.FixedLengthStream = original;
+    else delete scope.FixedLengthStream;
+  }
+  assert.equal(response.status, 502);
+  const preparationError = await response.json();
+  assert.equal(preparationError.code, 'upload_request_invalid');
+  assert(!JSON.stringify(preparationError).includes(privateError));
+  assert(!JSON.stringify(preparationError).includes('signature'));
+  assert.equal(state.videoPutCalls, 0);
+
+  const transfer = await makeUpload();
+  runtime.capabilityFetch = async request => { await request.arrayBuffer(); throw new Error(privateError); };
+  const failed = await handle(put(transfer));
+  assert.equal(failed.status, 502);
+  const transferError = await failed.json();
+  assert.equal(transferError.code, 'storage_transfer_unavailable');
+  assert(!JSON.stringify(transferError).includes('redaction-sentinel'));
+  assert(!JSON.stringify(transferError).includes('private-storage'));
+  assert.equal((await repository.getRecording(transfer.id))?.uploadAttempted, true, 'an unknown provider outcome remains fenced for reconciliation');
+  assert.equal((await repository.getRecording(transfer.id))?.uploadSha256, null);
+
+  const interrupted = await makeUpload();
+  const controller = new AbortController();
+  runtime.capabilityFetch = async () => { controller.abort(); throw new Error(privateError); };
+  const cancelled = await handle(new Request(put(interrupted), { signal: controller.signal }));
+  assert.equal(cancelled.status, 408, 'the transport diagnostic must preserve timeout/abort handling');
+  assert.equal((await cancelled.json()).code, 'upload_timeout');
+});
