@@ -73,6 +73,7 @@ function fakeRuntime() {
   };
 
   const capabilityFetch = async (request: Request) => {
+    assert.equal(request.redirect, 'manual', 'Workers supports manual redirects; every capability response must be checked by the app');
     const url = new URL(request.url);
     if (request.method === 'PUT' && url.pathname.startsWith('/upload/')) {
       state.videoPutCalls++;
@@ -407,4 +408,28 @@ test('upload diagnostics distinguish preparation and transport failures without 
   const cancelled = await handle(new Request(put(interrupted), { signal: controller.signal }));
   assert.equal(cancelled.status, 408, 'the transport diagnostic must preserve timeout/abort handling');
   assert.equal((await cancelled.json()).code, 'upload_timeout');
+});
+
+test('signed storage redirects are neither followed nor exposed as successful uploads or videos', async t => {
+  const { handle, req, runtime, prepare, complete, state } = await setup(t);
+  const recording = await complete(await prepare());
+  const upload = await (await handle(req('/api/recordings/uploads', { value: { ...DETAILS, id: crypto.randomUUID() } }))).json();
+  let redirectedCalls = 0;
+  runtime.capabilityFetch = async request => {
+    redirectedCalls++;
+    assert.equal(request.redirect, 'manual');
+    if (request.body) await request.arrayBuffer();
+    return new Response('Do not follow this redirect.', { status: 307, headers: { location: 'https://untrusted.test/collect' } });
+  };
+  const put = await handle(req(upload.uploadUrl, { method: 'PUT', body: VIDEO.slice().buffer, headers: upload.headers }));
+  assert.equal(put.status, 502);
+  assert.equal((await put.json()).code, 'upload_failed');
+  assert.equal(put.headers.get('location'), null);
+  assert.equal(redirectedCalls, 1);
+  assert.equal(state.videoPutCalls, 1, 'the previously prepared video is the only accepted object');
+  const video = await handle(req(recording.videoUrl, { anonymous: true }));
+  assert.equal(video.status, 502);
+  assert.equal((await video.json()).code, 'video_unavailable');
+  assert.equal(video.headers.get('location'), null);
+  assert.equal(redirectedCalls, 2, 'one explicit capability request per operation, with no redirect follow-up');
 });

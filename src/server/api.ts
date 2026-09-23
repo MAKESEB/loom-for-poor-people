@@ -259,7 +259,7 @@ async function storedVideoDigest(runtime: StorageRuntime, recording: RecordingRo
   let capability;
   try { capability = await runtime.storage.createSignedRead(recording.objectKey); }
   catch (error) { if (errorCode(error) === 'storage_object_not_found') return null; throw error; }
-  const response = await runtime.capabilityFetch(new Request(capability.url, { headers: capability.requiredHeaders, redirect: 'error', signal }));
+  const response = await runtime.capabilityFetch(new Request(capability.url, { headers: capability.requiredHeaders, redirect: 'manual', signal }));
   if (response.status === 404) { await response.body?.cancel(); return null; }
   if (!response.ok || !response.body) { await response.body?.cancel(); throw new ApiError(502, 'video_unavailable', 'The uploaded recording could not be verified.'); }
   try { return await hashBody(response.body, recording.sizeBytes, signal); }
@@ -338,7 +338,7 @@ async function uploadVideo(request: Request, runtime: StorageRuntime, repository
       let outgoing: Request;
       try {
         outgoing = new Request(reserved.capability.url, {
-          method: 'PUT', headers, body: fixedLengthBody(body, recording.sizeBytes), redirect: 'error', signal: controller.signal, duplex: 'half',
+          method: 'PUT', headers, body: fixedLengthBody(body, recording.sizeBytes), redirect: 'manual', signal: controller.signal, duplex: 'half',
         } as RequestInit);
       } catch {
         throw new ApiError(502, 'upload_request_invalid', 'The upload request could not be prepared. Please try again.');
@@ -384,7 +384,7 @@ async function streamVideo(request: Request, runtime: StorageRuntime, recording:
   if (ifRange && ifRange.length <= 256) headers.set('if-range', ifRange);
   const capability = await runtime.storage.createSignedRead(recording.objectKey);
   for (const [name, value] of Object.entries(capability.requiredHeaders)) headers.set(name, value);
-  const upstream = await runtime.capabilityFetch(new Request(capability.url, { method: 'GET', headers, redirect: 'error' }));
+  const upstream = await runtime.capabilityFetch(new Request(capability.url, { method: 'GET', headers, redirect: 'manual' }));
   if (![200, 206, 416].includes(upstream.status)) { await upstream.body?.cancel(); throw new ApiError(502, 'video_unavailable', 'The recording could not be loaded. Please try again.'); }
   const responseHeaders = commonHeaders();
   responseHeaders.set('content-type', recording.contentType);

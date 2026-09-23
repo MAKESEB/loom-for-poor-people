@@ -78,6 +78,7 @@ async function setup(t: TestContext) {
     },
     async capabilityFetch(request: Request) {
       calls.push('storage-read');
+      assert.equal(request.redirect, 'manual', 'storage capabilities must use the workerd-supported redirect policy');
       assert.equal(request.headers.get('authorization'), 'private-capability');
       return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
     },

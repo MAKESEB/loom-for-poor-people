@@ -297,7 +297,7 @@ test('provider redirects are never followed with credentials during start or vid
       fetch: fakeFetch(async (request) => {
         calls++;
         assert.equal(new URL(request.url).origin, GOOGLE_ORIGIN);
-        assert(['error', 'manual'].includes(request.redirect), 'automatic redirects could disclose API credentials');
+        assert.equal(request.redirect, 'manual', 'workerd supports manual redirects; automatic redirects could disclose API credentials');
         if (calls === 1 && redirectStage === 'upload') {
           return new Response(null, { headers: { 'x-goog-upload-url': UPLOAD_URL } });
         }
@@ -307,6 +307,24 @@ test('provider redirects are never followed with credentials during start or vid
     await assert.rejects(client.uploadFile(uploadInput()), GeminiError);
     assert.equal(calls, redirectStage === 'start' ? 1 : 2);
   }
+});
+
+test('an inference redirect is rejected without forwarding video or credentials and remains uncertain', async () => {
+  let calls = 0;
+  const client = createGeminiClient({
+    apiKey: API_KEY,
+    fetch: fakeFetch(async request => {
+      calls++;
+      assert.equal(new URL(request.url).origin, GOOGLE_ORIGIN);
+      assert.equal(request.redirect, 'manual');
+      return new Response(null, { status: 307, headers: { location: 'https://attacker.example/steal' } });
+    }),
+  });
+  await assertProviderError(client.createInteraction({
+    jobId: INTERACTION_INPUT.jobId, contentType: 'video/webm', goal: 'Briefing',
+    inline: { sizeBytes: 4, openBody: async () => bytesStream(new Uint8Array(4)) },
+  }), { ambiguous: true, status: 307 });
+  assert.equal(calls, 1, 'no request may follow the redirect or repeat generation');
 });
 
 test('oversized declared uploads fail before reserving Google storage or opening the source', async () => {

@@ -311,10 +311,12 @@ export function createGeminiClient(config: GeminiClientConfig) {
     try {
       const resolved = typeof init === 'function' ? await init(controller.signal) : init;
       body = resolved.body;
-      const response = await providerFetch(url, { ...resolved, headers: headers(resolved.headers), signal: controller.signal, redirect: 'error' });
+      // workerd only supports follow/manual. Reject non-2xx ourselves so neither
+      // credentials nor the video body can be forwarded to a redirect destination.
+      const response = await providerFetch(url, { ...resolved, headers: headers(resolved.headers), signal: controller.signal, redirect: 'manual' });
       if (!response.ok && !(options.allowMissing && response.status === 404)) {
         await response.body?.cancel();
-        throw new GeminiError('provider_request_failed', response.status, Boolean(options.creating && (response.status >= 500 || response.status === 408)));
+        throw new GeminiError('provider_request_failed', response.status, Boolean(options.creating && (response.status >= 500 || response.status === 408 || (response.status >= 300 && response.status < 400))));
       }
       return await parse(response);
     } catch (error) {
@@ -359,7 +361,7 @@ export function createGeminiClient(config: GeminiClientConfig) {
           'content-length': String(input.sizeBytes),
           'X-Goog-Upload-Offset': '0',
           'X-Goog-Upload-Command': 'upload, finalize',
-        }), body, duplex: 'half', signal: controller.signal, redirect: 'error',
+        }), body, duplex: 'half', signal: controller.signal, redirect: 'manual',
       };
       const response = await providerFetch(uploadUrl, init);
       if (!response.ok) {

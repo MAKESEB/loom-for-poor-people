@@ -137,7 +137,7 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
         const capability = await runtime.storage.createSignedRead(recording.objectKey);
         if (signal.aborted) throw new GeminiError('storage_read_failed');
         const response = await runtime.capabilityFetch(new Request(capability.url, {
-          method: 'GET', headers: capability.requiredHeaders, redirect: 'error', signal,
+          method: 'GET', headers: capability.requiredHeaders, redirect: 'manual', signal,
         }));
         const contentLength = response.headers.get('content-length');
         if (!response.ok || !response.body || (contentLength !== null && Number(contentLength) !== recording.sizeBytes)) {
