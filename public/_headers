@@ -1,5 +1,3 @@
-# The recorder needs same-origin playback, local previews and microphone access.
-# Keep all other browser capabilities and content sources restricted.
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'none'
-  Permissions-Policy: camera=(), geolocation=(), microphone=(self)
+  Content-Security-Policy: media-src 'self' blob:
+  Permissions-Policy: microphone=(self)

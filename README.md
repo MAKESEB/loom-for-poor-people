@@ -38,7 +38,11 @@ An ambiguous Gemini creation result is marked uncertain and requires an explicit
 
 ## Hosting
 
-The authorized deployment is in the **MAKESEB** workspace, in the **EU**, with **shared Dev/production data**. `ohmyhost.yaml` enables only hosting, private storage, Postgres, scheduled recovery and the Gemini API egress origin. Application access is custom UUID authentication; managed auth and mail are disabled.
+The authorized deployment is in the **MAKESEB** workspace, in the **EU**, with **shared Dev/production data**. `ohmyhost.yaml` enables only hosting, private storage, Postgres, scheduled recovery and the required Gemini and EU storage egress origins. Application access is custom UUID authentication; managed auth and mail are disabled.
+
+`public/_headers` uses ohmyho.st's exact supported opt-in: `media-src 'self' blob:` and `microphone=(self)`. The gateway retains its other restrictions. Do not replace these fragments with a complete CSP or additional permission directives: broader declarations are ignored. Verify the actual document headers and browser playback after deploying.
+
+Protected Dev uses `ohmyhost project dev-share link --project <project-id> --json`. Its reusable link opens a browser session without automatic expiry; keep it private to intended recipients. The app's UUID login and per-video viewing tokens remain separate from this hosting access link.
 
 Server settings, installed through the hosting CLI's stdin-only secret workflow in both environments:
 
