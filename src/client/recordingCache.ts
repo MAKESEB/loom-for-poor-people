@@ -63,14 +63,18 @@ async function writeActivity(directory: FileSystemDirectoryHandle, at: number) {
 }
 
 /** Never recursively remove an unknown file or a nested directory. */
-async function containsOnlyCacheFiles(directory: FileSystemDirectoryHandle): Promise<boolean> {
+async function containsOnlyCacheFiles(directory: FileSystemDirectoryHandle, ownedFiles?: ReadonlySet<string>): Promise<boolean> {
   const iterator = (directory as DirectoryEntries).entries();
+  // Live owners know their exact files, so even very long captures can be removed.
+  // One extra iterator step observes completion (or an unexpected additional file).
+  const maximumEntries = ownedFiles ? ownedFiles.size + 1 : MAX_DIRECTORY_ENTRIES;
   try {
-    for (let count = 0; count < MAX_DIRECTORY_ENTRIES; count += 1) {
+    for (let count = 0; count < maximumEntries; count += 1) {
       const next = await iterator.next();
       if (next.done) return true;
       const [name, handle] = next.value;
-      if (handle.kind !== 'file' || (name !== CACHE_MARKER_NAME && !PART_FILE.test(name))) return false;
+      const knownName = ownedFiles ? ownedFiles.has(name) : name === CACHE_MARKER_NAME || PART_FILE.test(name);
+      if (handle.kind !== 'file' || !knownName) return false;
     }
     // An unexpectedly large directory is preserved rather than scanned without a bound.
     return false;
@@ -134,6 +138,7 @@ export async function createTemporaryRecordingStore(
     let lastMarkerAttempt = now();
     await writeActivity(directory, lastMarkerAttempt);
     const ownedDirectory = directory;
+    const ownedFiles = new Set([CACHE_MARKER_NAME]);
     let pending = Promise.resolve();
     let disposed = false;
     let disposing: Promise<void> | undefined;
@@ -142,7 +147,9 @@ export async function createTemporaryRecordingStore(
         if (disposed) return Promise.reject(new Error('This recording has been discarded.'));
         if (!Number.isSafeInteger(index) || index < 0 || index >= 100_000_000) return Promise.reject(new Error('The recording part is invalid.'));
         const operation = pending.then(async () => {
-          const file = await ownedDirectory.getFileHandle(`part-${index.toString().padStart(8, '0')}`, { create: true });
+          const filename = `part-${index.toString().padStart(8, '0')}`;
+          const file = await ownedDirectory.getFileHandle(filename, { create: true });
+          ownedFiles.add(filename);
           const writer = await file.createWritable();
           try {
             await writer.write(chunk);
@@ -167,7 +174,7 @@ export async function createTemporaryRecordingStore(
         disposed = true;
         disposing = pending.then(async () => {
           try {
-            if (await containsOnlyCacheFiles(ownedDirectory)) await parent.removeEntry(name, { recursive: true });
+            if (await containsOnlyCacheFiles(ownedDirectory, ownedFiles)) await parent.removeEntry(name, { recursive: true });
           } catch (error) {
             if (!(error instanceof DOMException && error.name === 'NotFoundError')) throw error;
           } finally { await lease.release(); }

@@ -433,3 +433,47 @@ test('disposal preserves unexpected data but still releases its lease and closes
   assert.equal(locks.held.size, 0);
   await assert.rejects(store.write(0, new Blob(['too late'])), /discarded/);
 });
+
+test('disposing a long recording removes all owned parts beyond the stale-cache scan limit', async () => {
+  const { parent, locks, storage } = fixture();
+  const id = uuid(1);
+  const lockName = `${RECORDING_CACHE_LOCK_PREFIX}${id}`;
+  const store = await createTemporaryRecordingStore(storage, locks.asManager(), { now: () => NOW, randomUUID: () => id });
+  const part = new Blob(['recorded frame']);
+  for (let index = 0; index < 8193; index += 1) await store.write(index, part);
+  const directory = await parent.getDirectoryHandle(id);
+  assert.equal(directory.children.size, 8194, 'the marker and every distinct part exist before disposal');
+  assert.equal(locks.held.has(lockName), true);
+
+  await store.dispose();
+
+  assert.equal(parent.children.has(id), false, 'owned disposal must not inherit the abandoned-cache scan limit');
+  assert.deepEqual(parent.removed, [id]);
+  assert.equal(locks.held.has(lockName), false);
+  assert.equal(locks.releases.get(lockName), 1);
+});
+
+for (const entryKind of ['file', 'directory'] as const) {
+  test(`disposal preserves an unowned part-shaped ${entryKind} and releases the recording lock`, async () => {
+    const { parent, locks, storage } = fixture();
+    const id = uuid(1);
+    const store = await createTemporaryRecordingStore(storage, locks.asManager(), { now: () => NOW, randomUUID: () => id });
+    await store.write(0, new Blob(['owned part']));
+    const directory = await parent.getDirectoryHandle(id);
+    const name = 'part-00000001';
+    const unexpected = entryKind === 'file'
+      ? directory.file(name, 'unowned part data')
+      : directory.directory(name);
+    if (unexpected.kind === 'directory') unexpected.file('notes.txt', 'nested data');
+
+    await store.dispose();
+
+    assert.equal(parent.children.get(id), directory);
+    assert.equal(directory.children.get(name), unexpected);
+    assert.deepEqual(parent.removed, []);
+    if (unexpected.kind === 'file') assert.equal(await unexpected.data.text(), 'unowned part data');
+    else assert.equal(await (await unexpected.getFileHandle('notes.txt')).data.text(), 'nested data');
+    assert.equal(locks.held.has(`${RECORDING_CACHE_LOCK_PREFIX}${id}`), false);
+    await assert.rejects(store.write(1, new Blob(['too late'])), /discarded/);
+  });
+}
