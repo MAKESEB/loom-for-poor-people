@@ -1,11 +1,13 @@
 import { createGeminiClient, GeminiError, type GeminiClient, type GeminiClientConfig, type GeminiFile, type GeminiInteraction } from './gemini';
 import type { StorageRuntime } from './storage';
 import type { JobPatch, MarkdownJob, MarkdownService, MarkdownView, RecordingRow, Repository } from './types';
+import { MAX_MARKDOWN_BYTES } from '../shared/policy';
 
 const LEASE_SECONDS = 240;
 const POLL_DELAY_MS = 5_000;
 const RETRY_DELAY_MS = 60_000;
 const MAX_DEFERRED_VIDEO_BYTES = 10 * 1024 * 1024;
+const MARKDOWN_SIZE_MESSAGE = 'Markdown generation is available for recordings up to 50 MiB.';
 const TERMINAL = new Set(['completed', 'failed', 'uncertain']);
 const UNKNOWN_MESSAGE = 'Gemini may have received this request, but its confirmation was lost. Generate again only if you want to start another attempt.';
 
@@ -132,6 +134,11 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
         await cleanup();
         return;
       }
+      if (recording.sizeBytes > MAX_MARKDOWN_BYTES) {
+        await fail(MARKDOWN_SIZE_MESSAGE);
+        await cleanup();
+        return;
+      }
 
       const openRecording = async (signal: AbortSignal) => {
         const capability = await runtime.storage.createSignedRead(recording.objectKey);
@@ -242,6 +249,9 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
 
   const service: MarkdownService & { advance: typeof advance; runPending: (limit?: number) => Promise<{ processed: number }> } = {
     async generate(recording, goal, requestId) {
+      if (recording.sizeBytes > MAX_MARKDOWN_BYTES) {
+        throw Object.assign(new Error(MARKDOWN_SIZE_MESSAGE), { code: 'markdown_too_large', status: 413 });
+      }
       const { job, created } = await repository.createJob({ id: crypto.randomUUID(), recordingId: recording.id, requestId, goal: goal.trim() });
       // HTTP waitUntil only has 30 seconds after the response. Large inline uploads
       // belong to the scheduled invocation's 120-second window instead.

@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { after, before, beforeEach, describe, test } from 'node:test';
 import { createLocalRepository } from '../src/dev/repository';
+import { createRepository, type QueryClient } from '../src/server/repository';
+import { MAX_RECORDING_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import type { JobStatus, RecordingRow } from '../src/server/types';
 
 function recordingInput(): RecordingRow {
@@ -20,12 +22,28 @@ describe('repository against the real Postgres migration', () => {
   let local: Awaited<ReturnType<typeof createLocalRepository>>;
 
   before(async () => { local = await createLocalRepository('memory://'); });
-  beforeEach(async () => { await local.database.exec('TRUNCATE slop_markdown_jobs, slop_recordings'); });
+  beforeEach(async () => { await local.database.exec('TRUNCATE slop_recording_parts, slop_markdown_jobs, slop_recordings'); });
   after(async () => { await local?.close(); });
 
   async function createJob(goal = 'Summarize the recording.') {
     const recording = await local.repository.createRecording(recordingInput());
     return (await local.repository.createJob({ id: randomUUID(), requestId: randomUUID(), recordingId: recording.id, goal })).job;
+  }
+
+  async function multipartRecording(sizeBytes = MAX_SINGLE_UPLOAD_BYTES + 1) {
+    return local.repository.createRecording({ ...recordingInput(), sizeBytes, durationSeconds: 7_200.5 });
+  }
+
+  async function finishPart(recordingId: string, index: number, release = true) {
+    assert(await local.repository.createPart(recordingId, index));
+    const owner = randomUUID();
+    const claimed = await local.repository.claimPart(recordingId, index, owner);
+    assert(claimed);
+    assert(await local.repository.savePartDigest(recordingId, index, owner, claimed.leaseVersion, 'd'.repeat(64)));
+    assert(await local.repository.attachPartTransfer(recordingId, index, owner, claimed.leaseVersion, `transfer-${index}`));
+    assert(await local.repository.completePart(recordingId, index, owner, claimed.leaseVersion));
+    if (release) await local.repository.releasePart(recordingId, index, owner, claimed.leaseVersion);
+    return { owner, fence: claimed.leaseVersion };
   }
 
   test('upload requests are idempotent under concurrent retries and preserve the original record', async () => {
@@ -105,6 +123,160 @@ describe('repository against the real Postgres migration', () => {
     assert.equal((await local.repository.saveUploadDigest(record.id, 'retry-writer', digest))?.uploadSha256, digest);
     assert.equal(await local.repository.saveUploadDigest(record.id, 'retry-writer', 'c'.repeat(64)), null);
     assert.equal((await local.repository.getRecording(record.id))?.uploadSha256, digest);
+  });
+
+  test('new recordings preserve long durations and select chunks only above the single-upload limit', async () => {
+    for (const sizeBytes of [MAX_SINGLE_UPLOAD_BYTES, MAX_SINGLE_UPLOAD_BYTES + 1, MAX_RECORDING_BYTES]) {
+      const record = await local.repository.createRecording({ ...recordingInput(), sizeBytes, durationSeconds: 7_200.5 });
+      assert.equal(record.sizeBytes, sizeBytes);
+      assert.equal(record.durationSeconds, 7_200.5);
+      assert.equal(record.storageMode, sizeBytes > MAX_SINGLE_UPLOAD_BYTES ? 'parts' : 'single');
+      assert.equal(record.chunkSizeBytes, sizeBytes > MAX_SINGLE_UPLOAD_BYTES ? UPLOAD_CHUNK_BYTES : undefined);
+      assert.equal(record.partCount, sizeBytes > MAX_SINGLE_UPLOAD_BYTES ? Math.ceil(sizeBytes / UPLOAD_CHUNK_BYTES) : undefined);
+      assert.deepEqual(await local.repository.getRecording(record.id), record);
+      const raw = (await local.database.query<{ size_bytes: number; duration_seconds: number }>(
+        'SELECT size_bytes, duration_seconds FROM slop_recordings WHERE id = $1', [record.id],
+      )).rows[0];
+      assert.equal(raw.size_bytes, Math.min(sizeBytes, MAX_SINGLE_UPLOAD_BYTES), 'legacy size constraints remain satisfied');
+      assert.equal(raw.duration_seconds, 900, 'legacy duration constraints remain satisfied without truncating public metadata');
+    }
+    for (const durationSeconds of [-1, Infinity, -Infinity, NaN]) {
+      await assert.rejects(local.repository.createRecording({ ...recordingInput(), durationSeconds }));
+    }
+    for (const sizeBytes of [0, MAX_RECORDING_BYTES + 1]) {
+      await assert.rejects(local.repository.createRecording({ ...recordingInput(), sizeBytes }));
+    }
+  });
+
+  test('part manifests derive immutable keys and exact sizes from the recording reservation', async () => {
+    const record = await multipartRecording();
+    const repeated = await Promise.all(Array.from({ length: 8 }, () => local.repository.createPart(record.id, 0)));
+    assert(repeated[0]);
+    assert(repeated.every(row => JSON.stringify(row) === JSON.stringify(repeated[0])));
+    assert.equal(repeated[0].objectKey, `recordings/${record.id}/parts/000000`);
+    assert.equal(repeated[0].sizeBytes, UPLOAD_CHUNK_BYTES);
+    assert.equal(repeated[0].leaseVersion, 0);
+    const last = await local.repository.createPart(record.id, record.partCount! - 1);
+    assert(last);
+    assert.equal(last.sizeBytes, record.sizeBytes - (record.partCount! - 1) * UPLOAD_CHUNK_BYTES);
+    assert.equal(last.objectKey, `recordings/${record.id}/parts/000006`);
+    assert.deepEqual((await local.repository.listParts(record.id)).map(part => part.index), [0, 6]);
+    for (const index of [-1, record.partCount!, 128, 1.5, NaN]) {
+      assert.equal(await local.repository.createPart(record.id, index), null);
+    }
+    const single = await local.repository.createRecording(recordingInput());
+    assert.equal(await local.repository.createPart(single.id, 0), null);
+    assert.equal(await local.repository.createPart(randomUUID(), 0), null);
+    assert.equal(await local.repository.getPart(record.id, 1), null);
+    const largest = await multipartRecording(MAX_RECORDING_BYTES);
+    assert.equal((await local.repository.createPart(largest.id, 127))?.sizeBytes, UPLOAD_CHUNK_BYTES);
+  });
+
+  test('part leases fence every data mutation across expired owners and same-owner reclaims', async () => {
+    const record = await multipartRecording();
+    assert(await local.repository.createPart(record.id, 0));
+    const owners = ['dev', 'production', 'retry'];
+    const claims = await Promise.all(owners.map(owner => local.repository.claimPart(record.id, 0, owner)));
+    assert.equal(claims.filter(Boolean).length, 1);
+    const claim = claims.find(Boolean)!;
+    const owner = owners[claims.findIndex(Boolean)];
+    const digest = 'a'.repeat(64);
+    const tryWrites = (writer: string, fence: number) => Promise.all([
+      local.repository.attachPartTransfer(record.id, 0, writer, fence, 'part-transfer'),
+      local.repository.savePartDigest(record.id, 0, writer, fence, digest),
+      local.repository.markPartAttempt(record.id, 0, writer, fence, true),
+      local.repository.completePart(record.id, 0, writer, fence),
+    ]);
+    assert.deepEqual(await tryWrites('wrong-owner', claim.leaseVersion), [null, null, null, null]);
+    assert.deepEqual(await tryWrites(owner, claim.leaseVersion + 1), [null, null, null, null]);
+    assert.equal((await local.repository.attachPartTransfer(record.id, 0, owner, claim.leaseVersion, 'part-transfer'))?.transferId, 'part-transfer');
+    assert.equal(await local.repository.attachPartTransfer(record.id, 0, owner, claim.leaseVersion, 'other-transfer'), null);
+    assert.equal((await local.repository.savePartDigest(record.id, 0, owner, claim.leaseVersion, digest))?.uploadSha256, digest);
+    assert.equal(await local.repository.savePartDigest(record.id, 0, owner, claim.leaseVersion, 'b'.repeat(64)), null);
+    assert.equal((await local.repository.markPartAttempt(record.id, 0, owner, claim.leaseVersion, true))?.uploadAttempted, true);
+    await local.database.query("UPDATE slop_recording_parts SET lease_until = now() - interval '1 second' WHERE recording_id = $1", [record.id]);
+    assert.deepEqual(await tryWrites(owner, claim.leaseVersion), [null, null, null, null]);
+    const replacement = await local.repository.claimPart(record.id, 0, owner);
+    assert(replacement);
+    assert.equal(replacement.leaseVersion, claim.leaseVersion + 1);
+    assert.equal(replacement.uploadSha256, digest);
+    assert.equal(replacement.uploadAttempted, true);
+    assert.deepEqual(await tryWrites(owner, claim.leaseVersion), [null, null, null, null]);
+    await local.repository.releasePart(record.id, 0, owner, claim.leaseVersion);
+    await local.repository.releasePart(record.id, 0, 'wrong-owner', replacement.leaseVersion);
+    assert.equal(await local.repository.claimPart(record.id, 0, 'another-writer'), null);
+    assert.equal((await local.repository.markPartAttempt(record.id, 0, owner, replacement.leaseVersion, false))?.uploadAttempted, false);
+    await local.repository.releasePart(record.id, 0, owner, replacement.leaseVersion);
+    assert.equal((await local.repository.claimPart(record.id, 0, 'another-writer'))?.leaseVersion, replacement.leaseVersion + 1);
+  });
+
+  test('a part needs both its digest and transfer receipt before becoming immutable and ready', async () => {
+    const record = await multipartRecording();
+    assert(await local.repository.createPart(record.id, 0));
+    const claim = await local.repository.claimPart(record.id, 0, 'owner');
+    assert(claim);
+    assert.equal(await local.repository.completePart(record.id, 0, 'owner', claim.leaseVersion), null);
+    assert(await local.repository.savePartDigest(record.id, 0, 'owner', claim.leaseVersion, 'a'.repeat(64)));
+    assert.equal(await local.repository.completePart(record.id, 0, 'owner', claim.leaseVersion), null);
+    assert(await local.repository.attachPartTransfer(record.id, 0, 'owner', claim.leaseVersion, 'receipt'));
+    const ready = await local.repository.completePart(record.id, 0, 'owner', claim.leaseVersion);
+    assert.equal(ready?.uploadState, 'ready');
+    assert.equal(await local.repository.markPartAttempt(record.id, 0, 'owner', claim.leaseVersion, true), null);
+    assert.equal(await local.repository.savePartDigest(record.id, 0, 'owner', claim.leaseVersion, 'a'.repeat(64)), null);
+    await local.repository.releasePart(record.id, 0, 'owner', claim.leaseVersion);
+    assert.equal(await local.repository.claimPart(record.id, 0, 'new-owner'), null);
+    assert.deepEqual(await local.repository.createPart(record.id, 0), ready, 'ready retries are read-only');
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null, 'one ready part cannot publish the whole recording');
+    await local.repository.attachTransfer(record.id, 'legacy-receipt');
+    await assert.rejects(local.repository.completeRecording(record.id), /unavailable/, 'the old completion path cannot publish a chunked recording');
+  });
+
+  test('multipart publication is atomic, waits for all receipts and released leases, and freezes the manifest', async () => {
+    const record = await multipartRecording();
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null);
+    for (let index = 0; index < record.partCount! - 1; index++) await finishPart(record.id, index);
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null);
+    const lastIndex = record.partCount! - 1;
+    const last = await finishPart(record.id, lastIndex, false);
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null, 'a completed part with an active writer lease must not be published');
+    await local.repository.releasePart(record.id, lastIndex, last.owner, last.fence);
+    assert(await local.repository.claimUpload(record.id, 'whole-recording-writer'));
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null, 'a parent upload lease also fences publication');
+    await local.repository.releaseUpload(record.id, 'whole-recording-writer');
+    const completions = await Promise.all(Array.from({ length: 4 }, () => local.repository.completeMultipartRecording(record.id)));
+    assert(completions.every(value => value?.uploadState === 'ready'));
+    const manifest = await local.repository.listParts(record.id);
+    assert.equal(manifest.reduce((total, part) => total + part.sizeBytes, 0), record.sizeBytes);
+    assert.deepEqual(manifest.map(part => part.index), Array.from({ length: record.partCount! }, (_, index) => index));
+    assert.deepEqual(await local.repository.createPart(record.id, 0), manifest[0]);
+    assert.equal(await local.repository.createPart(record.id, record.partCount!), null);
+    assert.equal(await local.repository.claimPart(record.id, 0, 'post-publish'), null);
+    assert.equal(await local.repository.attachPartTransfer(record.id, lastIndex, last.owner, last.fence, 'new-receipt'), null);
+    assert.equal(await local.repository.savePartDigest(record.id, lastIndex, last.owner, last.fence, 'b'.repeat(64)), null);
+    assert.equal(await local.repository.markPartAttempt(record.id, lastIndex, last.owner, last.fence, true), null);
+    assert.equal(await local.repository.completePart(record.id, lastIndex, last.owner, last.fence), null);
+    assert.deepEqual(await local.repository.listParts(record.id), manifest);
+    assert.deepEqual(await local.repository.completeMultipartRecording(record.id), completions[0]);
+  });
+
+  test('publication rejects malformed manifests even when all parts claim to be ready', async () => {
+    const record = await multipartRecording();
+    for (let index = 0; index < record.partCount!; index++) await finishPart(record.id, index);
+    const first = (await local.repository.getPart(record.id, 0))!;
+    const corruptions = [
+      { set: 'size_bytes = size_bytes - 1', reset: 'size_bytes = $2', value: first.sizeBytes },
+      { set: "object_key = 'unexpected-part-key'", reset: 'object_key = $2', value: first.objectKey },
+      { set: 'upload_sha256 = NULL', reset: 'upload_sha256 = $2', value: first.uploadSha256 },
+      { set: 'transfer_id = NULL', reset: 'transfer_id = $2', value: first.transferId },
+      { set: "upload_state = 'pending'", reset: 'upload_state = $2', value: 'ready' },
+      { set: 'part_index = 127', reset: 'part_index = $2', value: 0 },
+    ];
+    for (const corruption of corruptions) {
+      await local.database.query(`UPDATE slop_recording_parts SET ${corruption.set} WHERE recording_id = $1 AND part_index = 0`, [record.id]);
+      assert.equal(await local.repository.completeMultipartRecording(record.id), null, corruption.set);
+      await local.database.query(`UPDATE slop_recording_parts SET ${corruption.reset} WHERE recording_id = $1 AND object_key = $3`, [record.id, corruption.value, corruption.set.startsWith('object_key') ? 'unexpected-part-key' : first.objectKey]);
+    }
+    assert.equal((await local.repository.completeMultipartRecording(record.id))?.uploadState, 'ready');
   });
 
   test('concurrent generation requests retain exactly one active job for a recording', async () => {
@@ -228,6 +400,27 @@ test('the additive upload migration preserves an existing legacy recording and s
     assert.deepEqual(rest, expected);
     await database.exec(outcomes);
     assert.deepEqual((await database.query('SELECT upload_attempted_at FROM slop_recordings WHERE id = $1', [record.id])).rows[0], { upload_attempted_at: attemptedAt });
+    const chunked = await readFile(new URL('../migrations/20260925090000_chunked_recordings.sql', import.meta.url), 'utf8');
+    await database.exec(chunked);
+    const expectedChunked = { ...upgraded, full_size_bytes: null, full_duration_seconds: null, storage_mode: 'single', chunk_size_bytes: null, part_count: null };
+    assert.deepEqual((await database.query('SELECT * FROM slop_recordings WHERE id = $1', [record.id])).rows[0], expectedChunked);
+    await database.exec(chunked);
+    assert.deepEqual((await database.query('SELECT * FROM slop_recordings WHERE id = $1', [record.id])).rows[0], expectedChunked, 'chunk migration is additive and replay-safe');
+    const client: QueryClient = {
+      async query({ text, values }) {
+        const result = await database.query<Record<string, unknown>>(text, [...values]);
+        return { rows: result.rows, rowCount: result.affectedRows ?? null, command: text.trim().split(/\s+/)[0].toUpperCase() };
+      },
+    };
+    const restored = await createRepository(client).getRecording(record.id);
+    assert(restored);
+    assert.equal(restored.sizeBytes, record.sizeBytes);
+    assert.equal(restored.durationSeconds, record.durationSeconds);
+    assert.equal(restored.storageMode, 'single');
+    assert.equal(restored.transferId, 'legacy-completed-transfer');
+    assert.equal(restored.protected, true);
+    assert.equal(restored.markdownEnabled, true);
+    assert.equal(restored.uploadState, 'ready');
   } finally {
     await database.close();
   }

@@ -4,14 +4,19 @@ import { createLocalRepository } from '../src/dev/repository';
 import { GeminiError, type GeminiClient, type GeminiFile, type GeminiInteraction } from '../src/server/gemini';
 import { createJobService } from '../src/server/jobs';
 import type { StorageRuntime } from '../src/server/storage';
-import type { RecordingRow } from '../src/server/types';
+import type { RecordingRow, Repository } from '../src/server/types';
+import { MAX_MARKDOWN_BYTES } from '../src/shared/policy';
 
 const bytes = new TextEncoder().encode('recorded video bytes');
 const uri = (name: string) => `https://generativelanguage.googleapis.com/v1beta/${name}`;
 
 async function setup(t: TestContext) {
   const local = await createLocalRepository('memory://');
-  t.after(() => local.close());
+  const deferred: Promise<unknown>[] = [];
+  t.after(async () => {
+    await Promise.allSettled(deferred);
+    await local.close();
+  });
   let recording: RecordingRow = {
     id: crypto.randomUUID(), requestId: crypto.randomUUID(), uploadId: crypto.randomUUID(),
     title: 'A walkthrough', contentType: 'video/webm', sizeBytes: bytes.length,
@@ -91,7 +96,7 @@ async function setup(t: TestContext) {
     assert(view.jobId);
     return view.jobId;
   };
-  return { ...local, recording, calls, state, files, client, runtime, makeService, service, due, generate };
+  return { ...local, recording, calls, state, files, client, runtime, makeService, service, due, generate, deferred };
 }
 
 test('durable processing survives closing the tab and UI polling only retrieves known interactions', async (t) => {
@@ -293,9 +298,10 @@ test('a lost streamed inline submission is never automatically repeated', async 
 
 test('videos larger than 10 MiB stay queued for cron instead of the short HTTP waitUntil window', async (t) => {
   const h = await setup(t);
-  await h.database.query('UPDATE slop_recordings SET size_bytes=$2 WHERE id=$1', [h.recording.id, 10 * 1024 * 1024 + 1]);
+  await h.database.query('UPDATE slop_recordings SET size_bytes=$2, full_size_bytes=$2 WHERE id=$1', [h.recording.id, 10 * 1024 * 1024 + 1]);
   const recording = await h.repository.getRecording(h.recording.id);
-  const deferred: Promise<unknown>[] = [];
+  assert.equal(recording?.sizeBytes, 10 * 1024 * 1024 + 1);
+  const deferred = h.deferred;
   const service = createJobService(h.repository, h.runtime, { apiKey: 'test-key', client: h.client, defer: (task) => { deferred.push(task); } });
   const result = await service.generate(recording!, '', crypto.randomUUID());
   assert.equal(result.status, 'queued');
@@ -303,4 +309,78 @@ test('videos larger than 10 MiB stay queued for cron instead of the short HTTP w
   assert.deepEqual(h.calls, []);
   const pending = await h.repository.listWork(4);
   assert.equal(pending[0].id, result.jobId, 'cron can claim the durable queued job');
+});
+
+test('oversized recordings reject Markdown before creating a job or starting any work', async (t) => {
+  const h = await setup(t);
+  let createCalls = 0;
+  const repository: Repository = {
+    ...h.repository,
+    async createJob(input) { createCalls++; return h.repository.createJob(input); },
+  };
+  const deferred = h.deferred;
+  const service = createJobService(repository, h.runtime, {
+    apiKey: 'test-key', client: h.client, defer: task => { deferred.push(task); },
+  });
+  await assert.rejects(
+    service.generate({ ...h.recording, sizeBytes: MAX_MARKDOWN_BYTES + 1 }, 'Transcribe this recording.', crypto.randomUUID()),
+    (error: unknown) => {
+      assert(error instanceof Error);
+      assert.equal((error as Error & { code: string }).code, 'markdown_too_large');
+      assert.equal((error as Error & { status: number }).status, 413);
+      assert.equal(error.message, 'Markdown generation is available for recordings up to 50 MiB.');
+      return true;
+    },
+  );
+  assert.equal(createCalls, 0, 'the policy must be checked before touching the job queue');
+  assert.equal(deferred.length, 0);
+  assert.deepEqual(h.calls, [], 'no provider or storage operation may start');
+  assert.equal(await h.repository.getLatestJob(h.recording.id), null);
+  assert.deepEqual(await h.repository.listWork(4), []);
+});
+
+for (const inputMethod of ['files', 'inline'] as const) {
+  test(`recovered oversized ${inputMethod} jobs fail before provider or storage work`, async (t) => {
+    const h = await setup(t);
+    const id = await h.generate();
+    const repository: Repository = {
+      ...h.repository,
+      async getRecording(recordingId) {
+        const recording = await h.repository.getRecording(recordingId);
+        return recording ? { ...recording, sizeBytes: MAX_MARKDOWN_BYTES + 1 } : null;
+      },
+    };
+    const service = createJobService(repository, h.runtime, { apiKey: 'test-key', client: h.client, inputMethod });
+    await service.runPending();
+    const job = await h.repository.getJob(id);
+    assert.equal(job?.status, 'failed');
+    assert.equal(job?.error, 'Markdown generation is available for recordings up to 50 MiB.');
+    assert.equal(job?.attempts, 0);
+    assert.equal(job?.providerFileName, null);
+    assert.equal(job?.interactionId, null);
+    assert.equal(job?.cleanupPending, false);
+    assert.deepEqual(h.calls, [], 'recovering an old oversized job must not send its video to Gemini');
+    assert.equal((await h.repository.getRecording(h.recording.id))?.uploadState, 'ready', 'the original video remains available');
+  });
+}
+
+test('an exactly 50 MiB recording still creates a durable job for cron', async (t) => {
+  const h = await setup(t);
+  let createCalls = 0;
+  const repository: Repository = {
+    ...h.repository,
+    async createJob(input) { createCalls++; return h.repository.createJob(input); },
+  };
+  const deferred = h.deferred;
+  const service = createJobService(repository, h.runtime, {
+    apiKey: 'test-key', client: h.client, defer: task => { deferred.push(task); },
+  });
+  const result = await service.generate({ ...h.recording, sizeBytes: MAX_MARKDOWN_BYTES }, '', crypto.randomUUID());
+  assert.equal(createCalls, 1);
+  assert.equal(result.status, 'queued');
+  assert(result.jobId);
+  assert.equal((await h.repository.getJob(result.jobId))?.status, 'queued');
+  assert.equal((await h.repository.listWork(4))[0]?.id, result.jobId);
+  assert.equal(deferred.length, 0, 'maximum-size videos must use the longer cron execution window');
+  assert.deepEqual(h.calls, []);
 });

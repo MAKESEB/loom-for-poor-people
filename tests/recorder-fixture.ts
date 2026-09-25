@@ -20,4 +20,19 @@ function draw() {
 }
 draw();
 Object.defineProperty(navigator.mediaDevices, 'getDisplayMedia', { value: async () => canvas.captureStream(30), configurable: true });
+Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { value: async () => {
+  const audio = new AudioContext();
+  const oscillator = audio.createOscillator();
+  const gain = audio.createGain();
+  const destination = audio.createMediaStreamDestination();
+  oscillator.frequency.value = 220;
+  gain.gain.value = 0.03;
+  oscillator.connect(gain).connect(destination);
+  oscillator.start();
+  await audio.resume();
+  const track = destination.stream.getAudioTracks()[0];
+  const stop = track.stop.bind(track);
+  track.stop = () => { stop(); oscillator.stop(); void audio.close(); };
+  return destination.stream;
+}, configurable: true });
 await import('../src/main');

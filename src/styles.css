@@ -106,8 +106,10 @@
 .recording-meta { display: inline-flex; align-items: center; gap: 7px; color: #8a8a93; font-size: 11px; line-height: 1.65; }
 .recording-meta > span { color: #d4d4d8; }
 .recorder-toolbar > [data-slot='button'] { color: #71717a; font-size: 11px; padding-inline: 8px; }
-.upload-progress { height: 2px; background: #f4f4f5; overflow: hidden; }
-.upload-progress > span { display: block; background: #18181b; height: 100%; transition: width .25s ease; }
+.upload-progress { appearance: none; display: block; width: 100%; height: 2px; border: 0; background: #f4f4f5; color: #18181b; }
+.upload-progress::-webkit-progress-bar { background: #f4f4f5; }
+.upload-progress::-webkit-progress-value { background: #18181b; transition: width .25s ease; }
+.upload-progress::-moz-progress-bar { background: #18181b; }
 .notice { font-size: 12px; color: #71717a; line-height: 1.65; margin-top: 17px; padding: 12px 14px; border: 1px solid #e4e4e7; border-radius: 7px; background: #fafafa; }
 .notice-error { color: #b04444; background: #fffafa; border-color: #f6d9d9; }
 .inline-link { display: inline; padding: 0; background: transparent; border: 0; text-decoration: underline; text-underline-offset: 3px; font: inherit; color: inherit; }
@@ -119,6 +121,8 @@
 .share-settings { margin-top: 34px; }
 .share-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .share-heading > label { font-size: 12px; font-weight: 550; color: #3f3f46; }
+.view-recording-link { display: inline-flex; align-items: center; gap: 3px; color: #71717a; font-size: 10px; }
+.view-recording-link:hover { color: #18181b; }
 .share-heading > span { display: inline-flex; gap: 5px; align-items: center; color: #a1a1aa; font-size: 10px; }
 .share-link-row { display: flex; gap: 8px; align-items: center; }
 .share-input-wrap { position: relative; flex: 1; min-width: 0; }

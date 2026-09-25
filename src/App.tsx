@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { ArrowLeft, ArrowRight, Check, CheckCheck, ChevronRight, Copy, Download, FileText, Link2, LoaderCircle, LockKeyhole, LogOut, Mic, MicOff, Monitor, Pause, Play, Plus, RefreshCw, ShieldCheck, Square, Volume2, VolumeX, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, Download, FileText, Link2, LoaderCircle, LockKeyhole, LogOut, Mic, MicOff, Monitor, Pause, Play, Plus, RefreshCw, ShieldCheck, Square, Volume2, VolumeX, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, ApiError, recordingApiPath, uploadBlob, type MarkdownResult, type Recording, type Upload } from './client/api';
+import { api, ApiError, recordingApiPath, uploadBlob, type MarkdownResult, type Recording, type RecordingView, type Upload } from './client/api';
 import { useScreenRecorder } from './client/useScreenRecorder';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { Switch } from './components/ui/switch';
 import { Textarea } from './components/ui/textarea';
+import { MAX_DURATION_SECONDS, MAX_MARKDOWN_BYTES, MAX_RECORDING_BYTES, MIB } from './shared/policy';
 
 const ACTIVE_JOBS = new Set<MarkdownResult['status']>(['queued', 'uploading', 'processing', 'submitting', 'generating']);
-const INITIAL_CONFIG = { maxBytes: 50 * 1024 * 1024, maxDurationSeconds: 900, configured: false };
+interface RecorderConfig { maxBytes: number; maxDurationSeconds: number | null; maxMarkdownBytes: number; configured: boolean }
+const INITIAL_CONFIG: RecorderConfig = { maxBytes: MAX_RECORDING_BYTES, maxDurationSeconds: MAX_DURATION_SECONDS, maxMarkdownBytes: MAX_MARKDOWN_BYTES, configured: false };
 
 function messageOf(error: unknown, fallback = 'Something went wrong. Please try again.') {
   return error instanceof Error ? error.message : fallback;
@@ -18,11 +20,14 @@ function messageOf(error: unknown, fallback = 'Something went wrong. Please try 
 
 function duration(seconds: number) {
   const value = Math.max(0, Math.floor(seconds));
-  return `${Math.floor(value / 60).toString().padStart(2, '0')}:${(value % 60).toString().padStart(2, '0')}`;
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor(value / 60) % 60;
+  return `${hours ? `${hours}:` : ''}${minutes.toString().padStart(2, '0')}:${(value % 60).toString().padStart(2, '0')}`;
 }
 
 function fileSize(bytes: number) {
-  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  if (bytes >= 1024 * MIB) return `${Number((bytes / (1024 * MIB)).toFixed(1))} GiB`;
+  return `${(bytes / MIB).toFixed(bytes < 10 * MIB ? 1 : 0)} MiB`;
 }
 
 function RoosterMark({ large = false }: { large?: boolean }) {
@@ -136,7 +141,7 @@ function MarkdownDocument({ markdown, downloadUrl }: { markdown: string; downloa
   </section>;
 }
 
-function RecordingDetails({ recording, onChange, token = '' }: { recording: Recording; onChange: (recording: Recording) => void; token?: string }) {
+function RecordingDetails({ recording, onChange, view, token = '' }: { recording: Recording; onChange: (recording: Recording) => void; view: RecordingView; token?: string }) {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [goal, setGoal] = useState('');
@@ -151,9 +156,12 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
   const resultVersion = useRef(0);
   const linkInput = useRef<HTMLInputElement>(null);
   const [manualLinkCopy, setManualLinkCopy] = useState(false);
+  const canManage = view === 'manage' && recording.isOwner;
+  const maxMarkdownBytes = recording.maxMarkdownBytes ?? MAX_MARKDOWN_BYTES;
+  const markdownEligible = recording.markdownEligible ?? recording.sizeBytes <= maxMarkdownBytes;
   const shareUrl = new URL(recording.sharePath, window.location.origin).href;
   const working = generationBusy || !!markdown?.enabled && ACTIVE_JOBS.has(markdown.status);
-  const showDocument = recording.markdownEnabled && markdown?.enabled === true && !!markdown.markdown;
+  const showDocument = recording.markdownEnabled && markdown?.enabled === true && !!markdown.markdown && (canManage || markdown.status === 'completed');
 
   useEffect(() => {
     if (!recording.markdownEnabled) return;
@@ -164,7 +172,7 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
       const version = resultVersion.current;
       let again = false;
       try {
-        const result = await api<MarkdownResult>(recordingApiPath(recording.id, 'markdown', token));
+        const result = await api<MarkdownResult>(recordingApiPath(recording.id, 'markdown', token, view));
         if (stopped || resultVersion.current !== version) return;
         setMarkdown(result);
         setPollError(false);
@@ -180,22 +188,22 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
     };
     void poll();
     return () => { stopped = true; clearTimeout(timer); };
-  }, [recording.id, recording.markdownEnabled, token, pollCycle]);
+  }, [recording.id, recording.markdownEnabled, token, view, pollCycle]);
 
   async function updateSettings(update: { protected?: boolean; markdownEnabled?: boolean }) {
-    if (settingsLock.current) return;
+    if (!canManage || settingsLock.current) return;
     settingsLock.current = true;
     setSettingsBusy(true);
     setSettingsError('');
     try {
-      const result = await api<Recording>(recordingApiPath(recording.id), { method: 'PATCH', body: JSON.stringify(update) });
+      const result = await api<Recording>(recordingApiPath(recording.id, '', '', 'manage'), { method: 'PATCH', body: JSON.stringify(update) });
       onChange(result);
     } catch (reason) { setSettingsError(messageOf(reason)); }
     finally { settingsLock.current = false; setSettingsBusy(false); }
   }
 
   async function generate() {
-    if (generationLock.current || working) return;
+    if (!canManage || !markdownEligible || generationLock.current || working) return;
     generationLock.current = true;
     resultVersion.current += 1;
     setGenerationBusy(true);
@@ -203,7 +211,7 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
     const cleanGoal = goal.trim();
     if (!pendingGeneration.current || pendingGeneration.current.goal !== cleanGoal) pendingGeneration.current = { id: crypto.randomUUID(), goal: cleanGoal };
     try {
-      const result = await api<MarkdownResult>(recordingApiPath(recording.id, 'markdown'), { method: 'POST', body: JSON.stringify({ goal: cleanGoal, requestId: pendingGeneration.current.id }) });
+      const result = await api<MarkdownResult>(recordingApiPath(recording.id, 'markdown', '', 'manage'), { method: 'POST', body: JSON.stringify({ goal: cleanGoal, requestId: pendingGeneration.current.id }) });
       pendingGeneration.current = null;
       setMarkdown(result);
       setPollError(false);
@@ -217,8 +225,8 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
   }
 
   return <>
-    {recording.isOwner && <section className="share-settings" aria-label="Sharing options">
-      <div className="share-heading"><label htmlFor="share-link">Ready to share</label><span><CheckCheck size={14} /> Saved</span></div>
+    {canManage && <section className="share-settings" aria-label="Sharing options">
+      <div className="share-heading"><label htmlFor="share-link">Ready to share</label><a className="view-recording-link" href={recording.sharePath} target="_blank" rel="noopener noreferrer">View recording<ChevronRight size={13} /></a></div>
       <div className="share-link-row"><div className="share-input-wrap"><Link2 size={16} /><Input id="share-link" ref={linkInput} value={shareUrl} readOnly onFocus={(event) => event.currentTarget.select()} aria-label="Share link" /></div><CopyButton text={shareUrl} onUnavailable={() => { setManualLinkCopy(true); linkInput.current?.focus(); linkInput.current?.select(); }} /></div>
       {manualLinkCopy && <p className="helper-text" role="status">The link is selected. Copy it with your keyboard.</p>}
       <div className="share-options">
@@ -228,8 +236,8 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
       {settingsError && <Notice error>{settingsError}</Notice>}
       {recording.markdownEnabled && <div className="goal-editor">
         <div className="goal-label"><label htmlFor="markdown-goal">Define the goal</label><span>Optional</span></div>
-        <Textarea id="markdown-goal" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Turn this into a brief with key takeaways and next steps…" maxLength={4000} rows={3} disabled={working} />
-        <div className="generation-action"><p>Generate sends this video to Gemini.<br className="mobile-break" /> Leave blank for a short briefing.</p><Button size="sm" disabled={working || settingsBusy} onClick={() => void generate()}>{working ? <Spinner label="Generating…" /> : <>{markdown?.markdown ? 'Generate again' : markdown?.status === 'uncertain' ? 'Try again' : 'Generate'}<ArrowRight /></>}</Button></div>
+        <Textarea id="markdown-goal" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Turn this into a brief with key takeaways and next steps…" maxLength={4000} rows={3} disabled={working || !markdownEligible} />
+        <div className="generation-action"><p>{markdownEligible ? <>Generate sends this video to Gemini.<br className="mobile-break" /> Leave blank for a short briefing.</> : <>Markdown is available for videos up to {fileSize(maxMarkdownBytes)}.<br className="mobile-break" /> Your video is ready to share.</>}</p><Button size="sm" disabled={working || settingsBusy || !markdownEligible} onClick={() => void generate()}>{working ? <Spinner label="Generating…" /> : <>{markdown?.markdown ? 'Generate again' : markdown?.status === 'uncertain' ? 'Try again' : 'Generate'}<ArrowRight /></>}</Button></div>
         {working && <p className="job-note" role="status">You can close this tab. Your Markdown will be waiting here.</p>}
         {markdown?.status === 'uncertain' && <Notice>The previous request may still be processing. Trying again starts a new request.</Notice>}
         {markdown?.status === 'failed' && <Notice error>{markdown.error || 'Markdown couldn’t be generated. Your video is ready to share; you can try again.'}</Notice>}
@@ -237,20 +245,18 @@ function RecordingDetails({ recording, onChange, token = '' }: { recording: Reco
         {pollError && <p className="helper-text" role="status">Reconnecting to check your Markdown…</p>}
       </div>}
     </section>}
-    {!recording.isOwner && recording.markdownEnabled && working && <div className="viewer-generating"><Spinner label="The Markdown is on its way." /><span>It will appear here when it’s ready.</span></div>}
-    {showDocument && <MarkdownDocument markdown={markdown!.markdown!} downloadUrl={recordingApiPath(recording.id, 'markdown/download', token)} />}
+    {showDocument && <MarkdownDocument markdown={markdown!.markdown!} downloadUrl={recordingApiPath(recording.id, 'markdown/download', token, view)} />}
   </>;
 }
 
-function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
+function Recorder({ onLogout, onSaved }: { onLogout: () => Promise<void>; onSaved: (recording: Recording) => void }) {
   const [config, setConfig] = useState(INITIAL_CONFIG);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [microphone, setMicrophone] = useState(true);
   const [systemAudio, setSystemAudio] = useState(true);
-  const [saveState, setSaveState] = useState<'idle' | 'uploading' | 'finalizing' | 'saved'>('idle');
+  const [saveState, setSaveState] = useState<'idle' | 'uploading' | 'finalizing'>('idle');
   const [progress, setProgress] = useState(0);
   const [saveError, setSaveError] = useState('');
-  const [saved, setSaved] = useState<Recording | null>(null);
   const [blobUrl, setBlobUrl] = useState('');
   const [logoutError, setLogoutError] = useState('');
   const uploadLock = useRef(false);
@@ -268,8 +274,9 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
 
   const refreshConfig = useCallback(async () => {
     try {
-      const value = await api<typeof INITIAL_CONFIG>('/api/config');
-      if (Number.isFinite(value.maxBytes) && value.maxBytes > 0 && Number.isFinite(value.maxDurationSeconds) && value.maxDurationSeconds > 0) setConfig({ ...value, configured: value.configured !== false });
+      const value = await api<RecorderConfig>('/api/config');
+      const validDuration = value.maxDurationSeconds === null || (Number.isFinite(value.maxDurationSeconds) && value.maxDurationSeconds > 0);
+      if (Number.isFinite(value.maxBytes) && value.maxBytes > 0 && validDuration) setConfig({ ...value, maxMarkdownBytes: Number.isFinite(value.maxMarkdownBytes) && value.maxMarkdownBytes > 0 ? value.maxMarkdownBytes : MAX_MARKDOWN_BYTES, configured: value.configured !== false });
     } catch { setConfig((value) => ({ ...value, configured: false })); }
     finally { setConfigLoaded(true); }
   }, []);
@@ -296,11 +303,11 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
   }, [capture.blob]);
 
   useEffect(() => {
-    if (!active && (!capture.blob || saved)) return;
+    if (!active && !capture.blob) return;
     const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
     window.addEventListener('beforeunload', protect);
     return () => window.removeEventListener('beforeunload', protect);
-  }, [active, capture.blob, saved]);
+  }, [active, capture.blob]);
 
   const saveRecording = useCallback(async () => {
     const blob = capture.blob;
@@ -311,7 +318,8 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
     try {
       if (!uploadedSession.current) {
         setProgress(0);
-        reservationBody.current ??= JSON.stringify({ id: crypto.randomUUID(), title: `Screen recording · ${new Date().toLocaleDateString('en', { month: 'short', day: 'numeric' })}`, contentType: blob.type, sizeBytes: blob.size, durationSeconds: Math.min(config.maxDurationSeconds, Math.max(1, Math.round(capture.seconds))) });
+        const recordedSeconds = Math.max(1, Math.round(capture.seconds));
+        reservationBody.current ??= JSON.stringify({ id: crypto.randomUUID(), title: `Screen recording · ${new Date().toLocaleDateString('en', { month: 'short', day: 'numeric' })}`, contentType: blob.type, sizeBytes: blob.size, durationSeconds: config.maxDurationSeconds === null ? recordedSeconds : Math.min(config.maxDurationSeconds, recordedSeconds) });
         const upload = await api<Upload>('/api/recordings/uploads', { method: 'POST', body: reservationBody.current });
         if (!upload.id) throw new Error('The upload could not be prepared. Your recording is still here.');
         if (!upload.alreadyUploaded) await uploadBlob(upload, blob, setProgress);
@@ -328,16 +336,13 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
         await new Promise<void>((resolve) => setTimeout(resolve, delay * 1000));
       }
       if (!result) throw new Error('Your video is still being prepared. Try again in a moment; it won’t need to upload again.');
-      setSaved(result);
-      setSaveState('saved');
-      window.history.replaceState(null, '', `/v/${result.id}`);
-      document.title = 'Your recording · Slop Rooster';
+      onSaved(result);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === 'storage_upload_expired') { uploadedSession.current = null; reservationBody.current = null; }
       setSaveState('idle');
       setSaveError(messageOf(reason, 'Your recording couldn’t be saved. Please try again.'));
     } finally { uploadLock.current = false; }
-  }, [capture.blob, capture.seconds, config]);
+  }, [capture.blob, capture.seconds, config, onSaved]);
 
   useEffect(() => {
     if (capture.phase !== 'preview' || !capture.blob || !config.configured || autoStarted.current === capture.blob || tooLarge) return;
@@ -345,32 +350,18 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
     void saveRecording();
   }, [capture.phase, capture.blob, config.configured, tooLarge, saveRecording]);
 
-  function reset() {
-    if (active || saving || capture.blob && !saved) return;
-    capture.reset();
-    setSaved(null);
-    setSaveState('idle');
-    setProgress(0);
-    setSaveError('');
-    autoStarted.current = null;
-    reservationBody.current = null;
-    uploadedSession.current = null;
-    window.history.replaceState(null, '', '/');
-    document.title = 'Slop Rooster — Your screen. One link.';
-  }
-
   return <>
-    <Header><Button variant="ghost" size="sm" disabled={active || saving || !!capture.blob && !saved} onClick={() => { setLogoutError(''); void onLogout().catch((error) => setLogoutError(messageOf(error))); }}><LogOut /><span className="logout-label">Sign out</span></Button></Header>
+    <Header><Button variant="ghost" size="sm" disabled={active || saving || !!capture.blob} onClick={() => { setLogoutError(''); void onLogout().catch((error) => setLogoutError(messageOf(error))); }}><LogOut /><span className="logout-label">Sign out</span></Button></Header>
     <main className="studio-main page-width">
-      <div className="page-heading"><div><div className="eyebrow">YOUR LITTLE RECORDING STUDIO</div><h1>{saved ? 'Ready when you are.' : preview ? 'That’s a wrap.' : 'Show what you mean.'}</h1></div>{saved ? <Button variant="outline" size="sm" onClick={reset}><Plus />New recording</Button> : <span className="heading-meta">{Math.round(config.maxDurationSeconds / 60)} min max <span>·</span> {fileSize(config.maxBytes)}</span>}</div>
+      <div className="page-heading"><div><div className="eyebrow">YOUR LITTLE RECORDING STUDIO</div><h1>{preview ? 'That’s a wrap.' : 'Show what you mean.'}</h1></div><span className="heading-meta">{fileSize(capture.maxBytes)} max</span></div>
       <section className={`recorder-card${recording ? ' is-recording' : ''}`} aria-label="Screen recorder">
-        <div className="player-topbar"><div className="player-status" role="status" aria-live="polite">{saved ? <><Check size={13} /><span>Recording saved</span></> : recording ? <><span className={`record-dot${capture.phase === 'paused' ? '' : ' pulsing'}`} /><span>{capture.phase === 'paused' ? 'Paused' : 'Recording'}</span></> : saving ? <Spinner label={saveState === 'finalizing' ? 'Getting your link…' : `Uploading · ${progress}%`} /> : <><span className="status-dot" /><span>{preview ? 'Preview' : 'Ready to record'}</span></>}</div><span className="timecode">{duration(capture.seconds)}</span></div>
+        <div className="player-topbar"><div className="player-status" role="status" aria-live="polite">{recording ? <><span className={`record-dot${capture.phase === 'paused' ? '' : ' pulsing'}`} /><span>{capture.phase === 'paused' ? 'Paused' : 'Recording'}</span></> : saving ? <Spinner label={saveState === 'finalizing' ? 'Getting your link…' : `Uploading · ${progress}%`} /> : <><span className="status-dot" /><span>{preview ? 'Preview' : 'Ready to record'}</span></>}</div><span className="timecode">{duration(capture.seconds)}</span></div>
         <div className={`video-stage${preview || recording || capture.phase === 'stopping' ? ' video-stage-filled' : ''}`}>
           {preview && blobUrl ? <video key={blobUrl} controls playsInline preload="metadata" src={blobUrl} aria-label="Preview your recording" /> : recording || capture.phase === 'stopping' ? <><video ref={liveVideo} autoPlay playsInline muted aria-label="Live screen preview" />{capture.phase === 'paused' && <span className="preview-state"><Pause size={12} />Paused</span>}{capture.phase === 'stopping' && <div className="video-overlay"><Spinner label="Finishing your recording…" /></div>}</> : <div className="empty-stage"><div className="empty-screen-icon"><Monitor size={31} strokeWidth={1.35} /><span className="empty-record-dot" /></div><h2>{capture.phase === 'requesting' ? 'Pick your screen.' : 'A little video goes a long way.'}</h2><p>{capture.phase === 'requesting' ? 'Choose what to share in the browser prompt.' : 'A tab, a window, or the whole picture.'}</p>{capture.phase === 'requesting' && <LoaderCircle className="spinner" size={18} aria-label="Waiting for screen selection" />}</div>}
         </div>
-        {saving && <div className="upload-progress" role="progressbar" aria-label="Upload progress" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${progress}%` }} /></div>}
+        {saving && <progress className="upload-progress" aria-label="Upload progress" value={progress} max={100} />}
         <div className="recorder-toolbar">
-          {preview ? <><span className="recording-meta">{fileSize(capture.blob?.size ?? 0)}<span>·</span>{saved ? 'All yours to share.' : saving ? 'Keep this tab open while we save.' : 'Your recording stays here until it’s saved.'}</span><Button asChild variant="ghost" size="sm"><a href={blobUrl} download={`slop-rooster.${capture.blob?.type === 'video/mp4' ? 'mp4' : 'webm'}`}><Download /><span className="download-label">Download video</span></a></Button></> : <><div className="audio-controls"><Button variant="ghost" size="sm" className={microphone ? 'audio-button audio-enabled' : 'audio-button'} aria-pressed={microphone} onClick={() => setMicrophone(!microphone)} disabled={active} title={microphone ? 'Microphone on' : 'Microphone off'}>{microphone ? <Mic /> : <MicOff />}<span>Mic {microphone ? 'on' : 'off'}</span></Button><Button variant="ghost" size="sm" className={systemAudio ? 'audio-button audio-enabled' : 'audio-button'} aria-pressed={systemAudio} onClick={() => setSystemAudio(!systemAudio)} disabled={active} title="System audio is available when supported by your selected screen or tab">{systemAudio ? <Volume2 /> : <VolumeX />}<span>System audio</span></Button></div><div className="capture-actions">{recording ? <><Button variant="outline" size="icon" onClick={capture.pauseOrResume} aria-label={capture.phase === 'paused' ? 'Resume recording' : 'Pause recording'}>{capture.phase === 'paused' ? <Play /> : <Pause />}</Button><Button className="stop-recording-button" onClick={capture.stop}><Square className="stop-icon" /><span>Stop recording</span></Button></> : <Button disabled={!canCapture || active} onClick={() => void capture.start({ microphone, systemAudio })}>{active ? <Spinner label="One moment…" /> : <><span className="button-record-dot" />Start recording</>}</Button>}</div></>}
+          {preview ? <><span className="recording-meta">{fileSize(capture.blob?.size ?? 0)}<span>·</span>{saving ? 'Keep this tab open while we save.' : 'Your recording stays here until it’s saved.'}</span><Button asChild variant="ghost" size="sm"><a href={blobUrl} download={`slop-rooster.${capture.blob?.type === 'video/mp4' ? 'mp4' : 'webm'}`}><Download /><span className="download-label">Download video</span></a></Button></> : <><div className="audio-controls"><Button variant="ghost" size="sm" className={microphone ? 'audio-button audio-enabled' : 'audio-button'} aria-pressed={microphone} onClick={() => setMicrophone(!microphone)} disabled={active} title={microphone ? 'Microphone on' : 'Microphone off'}>{microphone ? <Mic /> : <MicOff />}<span>Mic {microphone ? 'on' : 'off'}</span></Button><Button variant="ghost" size="sm" className={systemAudio ? 'audio-button audio-enabled' : 'audio-button'} aria-pressed={systemAudio} onClick={() => setSystemAudio(!systemAudio)} disabled={active} title="System audio is available when supported by your selected screen or tab">{systemAudio ? <Volume2 /> : <VolumeX />}<span>System audio</span></Button></div><div className="capture-actions">{recording ? <><Button variant="outline" size="icon" onClick={capture.pauseOrResume} aria-label={capture.phase === 'paused' ? 'Resume recording' : 'Pause recording'}>{capture.phase === 'paused' ? <Play /> : <Pause />}</Button><Button className="stop-recording-button" onClick={capture.stop}><Square className="stop-icon" /><span>Stop recording</span></Button></> : <Button disabled={!canCapture || active} onClick={() => void capture.start({ microphone, systemAudio })}>{active ? <Spinner label="One moment…" /> : <><span className="button-record-dot" />Start recording</>}</Button>}</div></>}
         </div>
       </section>
       {!preview && <div className="studio-caption"><span><LockKeyhole size={12} />You choose what gets recorded.</span><span>Video saves automatically when you stop.</span></div>}
@@ -381,14 +372,12 @@ function Recorder({ onLogout }: { onLogout: () => Promise<void> }) {
       {configLoaded && !config.configured && <Notice error>Uploads are temporarily unavailable. You can still record and download your video. <button className="inline-link" onClick={() => void refreshConfig()}>Check again</button></Notice>}
       {tooLarge && <Notice error>This recording is larger than {fileSize(config.maxBytes)}. Download a copy to keep it.</Notice>}
       {saveError && <Notice error><div className="upload-retry"><span>{saveError}</span><Button size="sm" variant="outline" onClick={() => void saveRecording()} disabled={saving || tooLarge || !config.configured}><RefreshCw />Retry upload</Button></div></Notice>}
-      {saved && <RecordingDetails recording={saved} onChange={setSaved} />}
     </main>
     <Footer />
   </>;
 }
 
-function Viewer({ id, authenticated, onLogout }: { id: string; authenticated: boolean; onLogout: () => Promise<void> }) {
-  const token = new URLSearchParams(window.location.search).get('token') ?? '';
+function Viewer({ id, view, token = '', sessionRevision, onLogout }: { id: string; view: RecordingView; token?: string; sessionRevision: number; onLogout: () => Promise<void> }) {
   const [recording, setRecording] = useState<Recording | null>(null);
   const [error, setError] = useState('');
   const [denied, setDenied] = useState(false);
@@ -401,35 +390,49 @@ function Viewer({ id, authenticated, onLogout }: { id: string; authenticated: bo
     setLoading(true);
     setError('');
     setDenied(false);
-    void api<Recording>(recordingApiPath(id, '', token)).then((result) => {
-      if (!cancelled) { setRecording(result); document.title = 'Watch · Slop Rooster'; }
+    void api<Recording>(recordingApiPath(id, '', token, view)).then((result) => {
+      if (cancelled) return;
+      if (view === 'manage' && !result.isOwner) {
+        window.dispatchEvent(new Event('slop-rooster:session-expired'));
+        throw new ApiError('Sign in to manage this recording.', 'authentication_required', 401);
+      }
+      setRecording(result);
+      document.title = `${view === 'manage' ? 'Manage' : 'Watch'} · Slop Rooster`;
     }).catch((reason) => {
-      if (!cancelled) { setError(messageOf(reason)); setDenied(reason instanceof ApiError && reason.status === 403); setRecording(null); }
+      if (!cancelled) { setError(messageOf(reason)); setDenied(view === 'public' && reason instanceof ApiError && reason.status === 403); setRecording(null); }
     }).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [id, token, authenticated, attempt]);
+  }, [id, token, view, sessionRevision, attempt]);
 
   return <>
-    <Header>{authenticated ? <><Button asChild variant="outline" size="sm"><a href="/"><Plus />New recording</a></Button><Button variant="ghost" size="icon" aria-label="Sign out" onClick={() => void onLogout().catch((reason) => setError(messageOf(reason)))}><LogOut /></Button></> : <Button asChild variant="ghost" size="sm"><a href="/">Record your screen<ChevronRight /></a></Button>}</Header>
+    <Header>{view === 'manage' && <><Button asChild variant="outline" size="sm"><a href="/"><Plus />New recording</a></Button><Button variant="ghost" size="icon" aria-label="Sign out" onClick={() => void onLogout().catch((reason) => setError(messageOf(reason)))}><LogOut /></Button></>}</Header>
     <main className="viewer-main page-width">
-      {loading ? <div className="page-state"><Spinner label="Getting your recording…" /></div> : !recording ? <div className="page-state"><div className="state-symbol">{denied ? <LockKeyhole /> : <Monitor />}</div><h1>{denied ? 'This link needs its token.' : 'Nothing to play here.'}</h1><p>{denied ? 'Ask the sender for the complete sharing link.' : error}</p><div className="state-actions"><Button variant="outline" onClick={() => setAttempt((value) => value + 1)}><RefreshCw />Try again</Button><Button asChild variant="ghost"><a href="/"><ArrowLeft />Back to the studio</a></Button></div></div> : <>
-        <div className="page-heading"><div><div className="eyebrow">{recording.isOwner ? 'YOUR RECORDING' : 'SHARED WITH YOU'}</div><h1>{recording.isOwner ? 'Ready when you are.' : 'A little show & tell.'}</h1></div><span className="heading-meta">{new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(new Date(recording.createdAt))}<span>·</span>{duration(recording.durationSeconds)}</span></div>
+      {loading && !recording ? <div className="page-state"><Spinner label="Getting your recording…" /></div> : !recording ? <div className="page-state"><div className="state-symbol">{denied ? <LockKeyhole /> : <Monitor />}</div><h1>{denied ? 'This link needs its token.' : 'Nothing to play here.'}</h1><p>{denied ? 'Ask the sender for the complete sharing link.' : error}</p><div className="state-actions"><Button variant="outline" onClick={() => setAttempt((value) => value + 1)}><RefreshCw />Try again</Button><Button asChild variant="ghost"><a href="/"><ArrowLeft />Back to the studio</a></Button></div></div> : <>
+        <div className="page-heading"><div><div className="eyebrow">{view === 'manage' ? 'YOUR RECORDING' : 'SHARED WITH YOU'}</div><h1>{view === 'manage' ? 'Ready when you are.' : 'A little show & tell.'}</h1></div><span className="heading-meta">{new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(new Date(recording.createdAt))}<span>·</span>{duration(recording.durationSeconds)}</span></div>
         <section className="recorder-card" aria-label="Shared recording"><div className="video-stage video-stage-filled"><video key={`${recording.videoUrl}:${attempt}`} src={recording.videoUrl} controls playsInline preload="metadata" aria-label="Shared video" onError={() => setMediaError(true)} onLoadedData={() => setMediaError(false)} /></div><div className="recorder-toolbar"><span className="recording-meta">{recording.protected ? <LockKeyhole size={13} /> : <Check size={13} />}{recording.protected ? 'Protected link' : 'Ready to watch'}<span>·</span>{fileSize(recording.sizeBytes)}</span><Button asChild variant="ghost" size="sm"><a href={recording.videoUrl} download={`slop-rooster.${recording.contentType === 'video/mp4' ? 'mp4' : 'webm'}`}><Download /><span>Download video</span></a></Button></div></section>
         {mediaError && <Notice error>This video couldn’t load. <button className="inline-link" onClick={() => { setMediaError(false); setAttempt((value) => value + 1); }}>Try again</button></Notice>}
         {error && <Notice error>{error}</Notice>}
-        <RecordingDetails recording={recording} onChange={setRecording} token={token} />
+        <RecordingDetails key={`${view}:${id}`} recording={recording} onChange={setRecording} view={view} token={token} />
       </>}
     </main>
     <Footer />
   </>;
 }
 
+function readRoute() {
+  return { pathname: window.location.pathname, search: window.location.search };
+}
+
 export default function App() {
   const [session, setSession] = useState<'loading' | 'authenticated' | 'anonymous'>('loading');
   const [sessionError, setSessionError] = useState('');
+  const [sessionRevision, setSessionRevision] = useState(0);
   const [loginRequired, setLoginRequired] = useState(false);
-  const [initialPath] = useState(() => window.location.pathname);
-  const viewerId = /^\/v\/([0-9a-f-]{36})\/?$/i.exec(initialPath)?.[1];
+  const [route, setRoute] = useState(readRoute);
+  const recordingRoute = /^\/(v|manage)\/([0-9a-f-]{36})\/?$/i.exec(route.pathname);
+  const viewerId = recordingRoute?.[1].toLowerCase() === 'v' ? recordingRoute[2] : undefined;
+  const manageId = recordingRoute?.[1].toLowerCase() === 'manage' ? recordingRoute[2] : undefined;
+  const token = new URLSearchParams(route.search).get('token') ?? '';
 
   const loadSession = useCallback(async () => {
     setSessionError('');
@@ -439,21 +442,39 @@ export default function App() {
     } catch (reason) { setSessionError(messageOf(reason)); }
   }, []);
 
-  useEffect(() => { void loadSession(); }, [loadSession]);
   useEffect(() => {
-    const expired = () => setLoginRequired(true);
+    const changed = () => setRoute(readRoute());
+    window.addEventListener('popstate', changed);
+    return () => window.removeEventListener('popstate', changed);
+  }, []);
+  useEffect(() => { if (!viewerId) void loadSession(); }, [loadSession, viewerId]);
+  useEffect(() => {
+    const expired = () => { if (!viewerId) setLoginRequired(true); };
     window.addEventListener('slop-rooster:session-expired', expired);
     return () => window.removeEventListener('slop-rooster:session-expired', expired);
-  }, []);
+  }, [viewerId]);
 
   const logout = useCallback(async () => {
     await api('/api/session', { method: 'DELETE' });
     setSession('anonymous');
-    if (!viewerId) { window.history.replaceState(null, '', '/'); document.title = 'Slop Rooster — Your screen. One link.'; }
-  }, [viewerId]);
+    setLoginRequired(false);
+  }, []);
 
-  const signedIn = () => { setSession('authenticated'); setLoginRequired(false); };
+  const recordingSaved = useCallback((recording: Recording) => {
+    window.history.replaceState(null, '', `/manage/${recording.id}`);
+    setRoute(readRoute());
+    document.title = 'Manage · Slop Rooster';
+  }, []);
+
+  const signedIn = () => {
+    setSession('authenticated');
+    setSessionRevision((revision) => revision + 1);
+    setLoginRequired(false);
+  };
+
+  // A sharing link always uses reader access, including in the creator's browser.
+  if (viewerId) return <Viewer key={`public:${viewerId}:${token}`} id={viewerId} view="public" token={token} sessionRevision={0} onLogout={logout} />;
   if (session === 'loading') return <><Header /><main className="page-state page-width">{sessionError ? <><Notice error>{sessionError}</Notice><Button variant="outline" onClick={() => void loadSession()}><RefreshCw />Try again</Button></> : <Spinner label="Opening the studio…" />}</main><Footer /></>;
-  if (!viewerId && session === 'anonymous') return <Login onSuccess={signedIn} />;
-  return <>{viewerId ? <Viewer id={viewerId} authenticated={session === 'authenticated'} onLogout={logout} /> : <Recorder onLogout={logout} />}{loginRequired && <Login modal onSuccess={signedIn} onClose={() => setLoginRequired(false)} />}</>;
+  if (session === 'anonymous') return <Login onSuccess={signedIn} />;
+  return <>{manageId ? <Viewer key={`manage:${manageId}`} id={manageId} view="manage" sessionRevision={sessionRevision} onLogout={logout} /> : <Recorder onLogout={logout} onSaved={recordingSaved} />}{loginRequired && <Login modal onSuccess={signedIn} onClose={() => setLoginRequired(false)} />}</>;
 }

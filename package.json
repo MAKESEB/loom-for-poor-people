@@ -17,12 +17,11 @@
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
-    "@ohmyhost/customer-runtime": "npm:@amerged/ohmyhost-runtime@0.1.19",
+    "@ohmyhost/customer-runtime": "npm:@amerged/ohmyhost-runtime@0.1.20",
     "@radix-ui/react-slot": "1.3.3",
     "@radix-ui/react-switch": "1.3.7",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
-    "fix-webm-duration": "1.0.6",
     "lucide-react": "1.47.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",

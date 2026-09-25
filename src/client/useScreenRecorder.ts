@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import fixWebmDuration from 'fix-webm-duration';
+import { fixRecordingDuration } from './fixWebmDuration';
+import { createRecordingBuffer, MAX_QUEUED_RECORDING_BYTES, type RecordingBuffer } from './recordingBuffer';
+import { MIB } from '../shared/policy';
 
 export type CapturePhase = 'idle' | 'requesting' | 'recording' | 'paused' | 'stopping' | 'preview';
 
-export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) {
+export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number | null) {
   const [phase, setPhaseState] = useState<CapturePhase>('idle');
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [blob, setBlob] = useState<Blob | null>(null);
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [capacityBytes, setCapacityBytes] = useState<number | null>(null);
+  const recordingBuffer = useRef<RecordingBuffer | null>(null);
   const phaseRef = useRef<CapturePhase>('idle');
   const recorder = useRef<MediaRecorder | null>(null);
   const sources = useRef<MediaStream[]>([]);
@@ -25,6 +29,10 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
   const setPhase = useCallback((next: CapturePhase) => {
     phaseRef.current = next;
     if (mounted.current) setPhaseState(next);
+  }, []);
+
+  const addNotice = useCallback((message: string) => {
+    if (mounted.current) setNotice(previous => previous.includes(message) ? previous : [previous, message].filter(Boolean).join(' '));
   }, []);
 
   const releaseDevices = useCallback(() => {
@@ -77,6 +85,7 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
     setError('');
     setNotice('');
     setPhase('requesting');
+    let preparedBuffer: RecordingBuffer | null = null;
     try {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 30, max: 30 } },
@@ -99,7 +108,7 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
           sources.current.push(mic);
           audioTracks.push(...mic.getAudioTracks());
         } catch {
-          if (mounted.current) setNotice('Your microphone wasn’t available. Your screen is being recorded without your voice.');
+          addNotice('Your microphone wasn’t available. Your screen is being recorded without your voice.');
         }
       }
       if (!mounted.current || version !== captureVersion.current) {
@@ -132,32 +141,62 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
         'video/mp4',
       ].find((type) => MediaRecorder.isTypeSupported(type));
       if (!mimeType) throw new Error('This browser can’t save a supported video format. Please try Chrome, Edge, or Firefox on a desktop.');
+      preparedBuffer = await createRecordingBuffer(limits.current.maxBytes);
+      if (!mounted.current || version !== captureVersion.current) {
+        await preparedBuffer.dispose().catch(() => {});
+        releaseDevices();
+        return;
+      }
+      if (videoTrack.readyState !== 'live') throw new Error('Screen sharing ended before recording could start. Please try again.');
+      const buffer = preparedBuffer;
+      const previousBuffer = recordingBuffer.current;
+      recordingBuffer.current = buffer;
+      void previousBuffer?.dispose().catch(() => {});
+      setCapacityBytes(buffer.maxBytes);
+      if (!buffer.diskBacked) addNotice(`Browser storage is unavailable. This recording is limited to ${Math.floor(buffer.maxBytes / MIB)} MiB.`);
+      else if (buffer.maxBytes < limits.current.maxBytes) addNotice(`Available browser storage limits this recording to ${Math.floor(buffer.maxBytes / MIB)} MiB.`);
       const mediaRecorder = new MediaRecorder(output, { mimeType, videoBitsPerSecond: 2_500_000 });
       recorder.current = mediaRecorder;
-      const chunks: Blob[] = [];
       let bytes = 0;
       mediaRecorder.ondataavailable = (event: BlobEvent) => {
+        if (!mounted.current || version !== captureVersion.current) return;
         if (event.data.size) {
-          chunks.push(event.data);
           bytes += event.data.size;
+          void buffer.append(event.data).catch(() => {
+            if (!mounted.current || version !== captureVersion.current) return;
+            addNotice('Browser storage could not keep up. Your recording is still available to save.');
+            stop();
+          });
         }
-        if (bytes >= limits.current.maxBytes - 5 * 1024 * 1024 && ['recording', 'paused'].includes(phaseRef.current)) {
-          setNotice('Recording stopped near the file size limit. Your recording is ready to save.');
+        const capacity = Math.min(limits.current.maxBytes, buffer.maxBytes);
+        if (bytes >= capacity - Math.min(5 * MIB, capacity / 10) && ['recording', 'paused'].includes(phaseRef.current)) {
+          addNotice('Recording stopped near the file size limit. Your recording is ready to save.');
+          stop();
+        } else if (buffer.queuedBytes > MAX_QUEUED_RECORDING_BYTES && ['recording', 'paused'].includes(phaseRef.current)) {
+          addNotice('Browser storage could not keep up. Your recording is still available to save.');
           stop();
         }
       };
       mediaRecorder.onstop = async () => {
         releaseDevices();
         if (!mounted.current) return;
-        let result = new Blob(chunks, { type: mediaRecorder.mimeType.startsWith('video/mp4') ? 'video/mp4' : 'video/webm' });
         recorder.current = null;
+        let result: Blob;
+        try { result = await buffer.finish(mediaRecorder.mimeType.startsWith('video/mp4') ? 'video/mp4' : 'video/webm'); }
+        catch {
+          if (!mounted.current || version !== captureVersion.current) return;
+          setError('The recording could not be finished. Please try again.');
+          setPhase('idle');
+          return;
+        }
+        if (!mounted.current || version !== captureVersion.current) return;
         if (!result.size) {
           setError('The browser didn’t capture any video. Please choose a screen or window and try again.');
           setPhase('idle');
           return;
         }
         if (result.type === 'video/webm') {
-          try { result = await fixWebmDuration(result, activeMs.current, { logger: false }); } catch { /* Keep the original capture if duration repair is unavailable. */ }
+          try { result = await fixRecordingDuration(result, activeMs.current); } catch { /* Preserve the original video if its layout cannot be repaired. */ }
         }
         if (!mounted.current || version !== captureVersion.current) return;
         setBlob(result);
@@ -179,12 +218,17 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
       timer.current = setInterval(() => {
         const currentSeconds = elapsed() / 1000;
         setSeconds(currentSeconds);
-        if (currentSeconds >= limits.current.maxDurationSeconds) {
-          setNotice(`You reached the ${Math.round(limits.current.maxDurationSeconds / 60)}-minute limit. Your recording is ready to save.`);
+        if (limits.current.maxDurationSeconds !== null && currentSeconds >= limits.current.maxDurationSeconds) {
+          addNotice(`You reached the ${Math.round(limits.current.maxDurationSeconds / 60)}-minute limit. Your recording is ready to save.`);
           stop();
         }
       }, 250);
     } catch (reason) {
+      if (preparedBuffer) {
+        if (recordingBuffer.current === preparedBuffer) recordingBuffer.current = null;
+        await preparedBuffer.dispose().catch(() => {});
+      }
+      recorder.current = null;
       releaseDevices();
       if (!mounted.current) return;
       const name = reason instanceof DOMException ? reason.name : '';
@@ -193,7 +237,7 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
         : reason instanceof Error ? reason.message : 'Recording couldn’t start. Please try again.');
       setPhase('idle');
     }
-  }, [elapsed, releaseDevices, setPhase, stop]);
+  }, [addNotice, elapsed, releaseDevices, setPhase, stop]);
 
   const reset = useCallback(() => {
     if (['recording', 'paused', 'requesting', 'stopping'].includes(phaseRef.current)) return;
@@ -201,6 +245,10 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
     setSeconds(0);
     setError('');
     setNotice('');
+    setCapacityBytes(null);
+    const previousBuffer = recordingBuffer.current;
+    recordingBuffer.current = null;
+    void previousBuffer?.dispose().catch(() => {});
     setPhase('idle');
   }, [setPhase]);
 
@@ -217,8 +265,11 @@ export function useScreenRecorder(maxBytes: number, maxDurationSeconds: number) 
         current.stop();
       }
       releaseDevices();
+      const previousBuffer = recordingBuffer.current;
+      recordingBuffer.current = null;
+      void previousBuffer?.dispose().catch(() => {});
     };
   }, [releaseDevices]);
 
-  return { phase, stream, blob, seconds, error, notice, start, stop, pauseOrResume, reset };
+  return { phase, stream, blob, seconds, error, notice, maxBytes: capacityBytes ?? maxBytes, start, stop, pauseOrResume, reset };
 }

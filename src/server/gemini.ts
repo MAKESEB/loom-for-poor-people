@@ -1,9 +1,9 @@
 import { fixedLengthBody } from './storage';
+import { MAX_MARKDOWN_BYTES } from '../shared/policy';
 
 const GOOGLE_ORIGIN = 'https://generativelanguage.googleapis.com';
 const API_BASE = `${GOOGLE_ORIGIN}/v1beta`;
 const API_REVISION = '2026-05-20';
-const MAX_INPUT_BYTES = 50 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_INTERACTION_BYTES = 96 * 1024 * 1024;
 const MAX_STRING_CHARACTERS = 256 * 1024;
@@ -262,7 +262,7 @@ function countedStream(source: ReadableStream<Uint8Array>, size: number): Readab
   return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       length += chunk.byteLength;
-      if (length > size || length > MAX_INPUT_BYTES) throw new GeminiError('input_size_invalid');
+      if (length > size || length > MAX_MARKDOWN_BYTES) throw new GeminiError('input_size_invalid');
       controller.enqueue(chunk);
     },
     flush() { if (length !== size) throw new GeminiError('input_size_invalid'); },
@@ -328,7 +328,7 @@ export function createGeminiClient(config: GeminiClientConfig) {
   }
 
   async function uploadFile(input: { name?: string; displayName: string; contentType: string; sizeBytes: number; openBody: (signal: AbortSignal) => Promise<ReadableStream<Uint8Array>> }): Promise<GeminiFile> {
-    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_INPUT_BYTES) throw new GeminiError('input_size_invalid');
+    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_MARKDOWN_BYTES) throw new GeminiError('input_size_invalid');
     if (!['video/webm', 'video/mp4'].includes(input.contentType)) throw new GeminiError('input_type_invalid');
     const uploadUrl = await request(`${GOOGLE_ORIGIN}/upload/v1beta/files`, {
       method: 'POST',
@@ -388,7 +388,7 @@ export function createGeminiClient(config: GeminiClientConfig) {
       if (!['video/webm', 'video/mp4'].includes(input.contentType)) throw new GeminiError('input_type_invalid');
       let video: Record<string, string>;
       if (input.inline) {
-        if (!Number.isSafeInteger(input.inline.sizeBytes) || input.inline.sizeBytes <= 0 || input.inline.sizeBytes > MAX_INPUT_BYTES) throw new GeminiError('input_size_invalid');
+        if (!Number.isSafeInteger(input.inline.sizeBytes) || input.inline.sizeBytes <= 0 || input.inline.sizeBytes > MAX_MARKDOWN_BYTES) throw new GeminiError('input_size_invalid');
         video = { type: 'video', data: '', mime_type: input.contentType, processing: 'static' };
       } else {
         const uri = googleUrl(input.fileUri);

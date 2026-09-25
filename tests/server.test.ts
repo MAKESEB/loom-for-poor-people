@@ -3,6 +3,7 @@ import { test, type TestContext } from 'node:test';
 import { createLocalRepository } from '../src/dev/repository';
 import type { MarkdownService } from '../src/server/types';
 import { createApiHandler, MAX_DURATION_SECONDS, MAX_VIDEO_BYTES } from '../src/server/api';
+import { MAX_MARKDOWN_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import { resolveStorageRuntime, StorageUnavailableError, storageBindingDiagnostics, type ManagedStorage, type StorageRuntime } from '../src/server/storage';
 
 const ORIGIN = 'https://app.test';
@@ -124,6 +125,7 @@ async function setup(t: TestContext, markdown?: MarkdownService) {
       method: options.method ?? (options.value === undefined ? 'GET' : 'POST'),
       headers: { ...(options.anonymous ? {} : { cookie }), ...(options.value === undefined ? {} : { 'content-type': 'application/json', origin: ORIGIN }), ...options.headers },
       ...(options.value !== undefined ? { body: JSON.stringify(options.value) } : options.body !== undefined ? { body: options.body } : {}),
+      ...(options.body instanceof ReadableStream ? { duplex: 'half' } : {}),
     });
   }
   async function prepare(details = DETAILS) {
@@ -215,7 +217,7 @@ test('validates limits, types, UUIDs, bounded JSON and same-origin writes', asyn
   const { handle, req, transfers } = await setup(t);
   for (const [change, status] of [
     [{ sizeBytes: MAX_VIDEO_BYTES + 1 }, 413], [{ sizeBytes: 0 }, 400], [{ sizeBytes: 3.5 }, 400],
-    [{ durationSeconds: MAX_DURATION_SECONDS + 1 }, 400], [{ durationSeconds: -1 }, 400],
+    [{ durationSeconds: -1 }, 400], [{ durationSeconds: Infinity }, 400], [{ durationSeconds: NaN }, 400],
     [{ contentType: 'text/html' }, 415], [{ contentType: 'video/webm;codecs=vp9' }, 415],
     [{ title: '' }, 400], [{ title: 'a'.repeat(101) }, 400], [{ title: 'a\u0000b' }, 400], [{ id: '../metadata' }, 400],
   ] as const) assert.equal((await handle(req('/api/recordings/uploads', { value: { ...DETAILS, ...change } }))).status, status, JSON.stringify(change));
@@ -432,4 +434,182 @@ test('signed storage redirects are neither followed nor exposed as successful up
   assert.equal((await video.json()).code, 'video_unavailable');
   assert.equal(video.headers.get('location'), null);
   assert.equal(redirectedCalls, 2, 'one explicit capability request per operation, with no redirect follow-up');
+});
+
+function patternedStream(length: number, start = 0, alterFirst = false) {
+  let emitted = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (emitted === length) { controller.close(); return; }
+      const bytes = new Uint8Array(Math.min(64 * 1024, length - emitted));
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (start + emitted + i) % 251;
+      if (emitted === 0 && alterFirst) bytes[0] ^= 1;
+      emitted += bytes.length;
+      controller.enqueue(bytes);
+    },
+  });
+}
+
+function expectedPattern(length: number, start: number) {
+  return Uint8Array.from({ length }, (_, index) => (start + index) % 251);
+}
+
+test('configuration separates 1 GiB recordings and 50 MiB Markdown with no independent duration cap', async t => {
+  const { handle, req, repository, transfers } = await setup(t);
+  const config = await (await handle(req('/api/config'))).json();
+  assert.equal(config.maxBytes, 1024 * 1024 * 1024);
+  assert.equal(config.maxDurationSeconds, null);
+  assert.equal(MAX_DURATION_SECONDS, null);
+  assert.equal(config.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
+  const large = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: MAX_VIDEO_BYTES, durationSeconds: 24 * 60 * 60 } }));
+  assert.equal(large.status, 201, await large.clone().text());
+  const reservation = await large.json();
+  assert.equal(reservation.chunkSizeBytes, UPLOAD_CHUNK_BYTES);
+  assert.equal(reservation.partCount, 128);
+  const row = await repository.getRecording(reservation.id);
+  assert.equal(row?.sizeBytes, MAX_VIDEO_BYTES);
+  assert.equal(row?.durationSeconds, 86400);
+  assert.equal(row?.storageMode, 'parts');
+  assert.equal(transfers.size, 0, 'a large reservation never reserves a single oversized provider PUT');
+  assert.equal((await handle(req('/api/recordings/uploads', { value: { ...DETAILS, id: crypto.randomUUID(), durationSeconds: 900.5 } }))).status, 201);
+});
+
+test('explicit public viewing ignores a creator cookie, and manage viewing always requires it', async t => {
+  const markdown: MarkdownService = {
+    async generate() { throw new Error('Public views must never generate'); },
+    async status(recording) { return { enabled: recording.markdownEnabled, status: 'completed', markdown: '# Retained private result' }; },
+  };
+  const { handle, req, prepare, complete } = await setup(t, markdown);
+  const recording = await complete(await prepare());
+  const base = `/api/recordings/${recording.id}`;
+  const publicMetadata = await (await handle(req(`${base}?view=public`))).json();
+  assert.equal(publicMetadata.isOwner, false);
+  assert(new URL(publicMetadata.videoUrl, ORIGIN).searchParams.get('view') === 'public');
+  assert.equal(publicMetadata.markdownEligible, true);
+  assert.equal(publicMetadata.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
+  for (const suffix of ['', '/video', '/markdown', '/markdown/download']) {
+    assert.equal((await handle(req(`${base}${suffix}?view=manage`, { anonymous: true }))).status, 401, suffix);
+  }
+  assert.equal((await handle(req(`${base}?view=public`, { method: 'PATCH', value: { protected: true } }))).status, 403);
+  assert.equal((await handle(req(`${base}/markdown?view=public`, { value: { requestId: REQUEST_ID, goal: 'Transcribe' } }))).status, 403);
+  assert.deepEqual(await (await handle(req(`${base}/markdown?view=public`))).json(), { enabled: false, status: 'idle', markdown: null });
+  const protectedMetadata = await (await handle(req(base, { method: 'PATCH', value: { protected: true, markdownEnabled: true } }))).json();
+  const token = new URL(protectedMetadata.sharePath, ORIGIN).searchParams.get('token');
+  for (const suffix of ['', '/video', '/markdown', '/markdown/download']) {
+    assert.equal((await handle(req(`${base}${suffix}?view=public`))).status, 403, 'creator cookie cannot bypass a protected public link');
+    assert.equal((await handle(req(`${base}${suffix}?view=public&token=${token}`))).status, 200);
+  }
+  const viewed = await (await handle(req(`${base}?view=public&token=${token}`))).json();
+  assert.equal(viewed.isOwner, false);
+  assert.equal((await handle(req(viewed.videoUrl))).status, 200);
+  assert.equal((await (await handle(req(`${base}?view=manage`))).json()).isOwner, true);
+});
+
+test('large bounded part uploads are immutable, publish atomically, seek across boundaries and reject AI', async t => {
+  let generated = 0;
+  const markdown: MarkdownService = {
+    async generate(recording) { generated++; return { enabled: recording.markdownEnabled, status: 'queued', markdown: null }; },
+    async status(recording) { return { enabled: recording.markdownEnabled, status: 'idle', markdown: null }; },
+  };
+  const { handle, req, complete, repository, transfers, state } = await setup(t, markdown);
+  const size = MAX_SINGLE_UPLOAD_BYTES + 17;
+  const reservationResponse = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: size, durationSeconds: 7200 } }));
+  assert.equal(reservationResponse.status, 201, await reservationResponse.clone().text());
+  const upload = await reservationResponse.json();
+  assert.equal(upload.partCount, 7);
+  assert.equal(upload.chunkSizeBytes, UPLOAD_CHUNK_BYTES);
+  assert.equal((await handle(req(`/api/recordings/${upload.id}/complete`, { value: { uploadId: upload.uploadId } }))).status, 202);
+  assert.equal((await handle(req(`/api/recordings/${upload.id}`, { anonymous: true }))).status, 404);
+  assert.equal((await handle(req(upload.uploadUrl, { method: 'PUT', body: VIDEO.slice().buffer, headers: upload.headers }))).status, 400);
+  for (const value of ['-1', '7', '1.5', '01']) {
+    assert.equal((await handle(req(`${upload.uploadUrl}&part=${value}`, { method: 'PUT', body: VIDEO.slice().buffer, headers: upload.headers }))).status, 400);
+  }
+  const put = (index: number, length: number, changed = false) => handle(req(`${upload.uploadUrl}&part=${index}`, {
+    method: 'PUT', body: patternedStream(length, index * UPLOAD_CHUNK_BYTES, changed), headers: upload.headers,
+  }));
+  // The final, shorter part can arrive first; client request order is not the manifest order.
+  const lastLength = size - 6 * UPLOAD_CHUNK_BYTES;
+  assert.equal((await put(6, lastLength - 1)).status, 400);
+  assert.equal((await put(6, lastLength + 1)).status, 400);
+  for (const index of [6, 0, 1, 2, 3, 4, 5]) {
+    const length = Math.min(UPLOAD_CHUNK_BYTES, size - index * UPLOAD_CHUNK_BYTES);
+    const response = await put(index, length);
+    assert.equal(response.status, 204, await response.clone().text());
+  }
+  const puts = state.videoPutCalls;
+  assert.equal((await put(6, lastLength)).status, 204);
+  assert.equal((await put(6, lastLength, true)).status, 409);
+  assert.equal(state.videoPutCalls, puts, 'accepted part retries never rewrite their provider objects');
+  assert([...transfers.values()].every(part => part.contentLength <= UPLOAD_CHUNK_BYTES));
+  const rows = await repository.listParts(upload.id);
+  assert.equal(rows.length, upload.partCount);
+  assert(rows.every(row => row.uploadState === 'ready' && row.uploadSha256 && row.transferId));
+  const completed = await Promise.all([complete(upload), complete(upload)]);
+  assert.deepEqual(completed[0], completed[1]);
+  const recording = completed[0];
+  assert.equal(recording.sizeBytes, size);
+  assert.equal(recording.durationSeconds, 7200);
+  assert.equal(recording.markdownEligible, false);
+  assert.equal(recording.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
+  const signedReads = state.signedReadCalls;
+  const head = await handle(req(`${recording.videoUrl}?view=public`, { method: 'HEAD', anonymous: true }));
+  assert.equal(head.status, 200); assert.equal(head.headers.get('content-length'), String(size));
+  assert.equal(state.signedReadCalls, signedReads, 'HEAD uses the durable manifest without downloading parts');
+  const offset = UPLOAD_CHUNK_BYTES - 19;
+  const range = await handle(req(`${recording.videoUrl}?view=public`, { headers: { range: `bytes=${offset}-${offset + 52}` }, anonymous: true }));
+  assert.equal(range.status, 206); assert.equal(range.headers.get('content-range'), `bytes ${offset}-${offset + 52}/${size}`);
+  assert.deepEqual(new Uint8Array(await range.arrayBuffer()), expectedPattern(53, offset));
+  const suffix = await handle(req(recording.videoUrl, { headers: { range: 'bytes=-31' }, anonymous: true }));
+  assert.deepEqual(new Uint8Array(await suffix.arrayBuffer()), expectedPattern(31, size - 31));
+  const outside = await handle(req(recording.videoUrl, { headers: { range: `bytes=${size}-` }, anonymous: true }));
+  assert.equal(outside.status, 416); assert.equal(outside.headers.get('content-range'), `bytes */${size}`);
+  await handle(req(`/api/recordings/${upload.id}`, { method: 'PATCH', value: { markdownEnabled: true, protected: true } }));
+  const deniedAi = await handle(req(`/api/recordings/${upload.id}/markdown`, { value: { goal: '', requestId: crypto.randomUUID() } }));
+  assert.equal(deniedAi.status, 413); assert.equal((await deniedAi.json()).code, 'markdown_too_large'); assert.equal(generated, 0);
+  assert.equal((await handle(req(`${recording.videoUrl}?view=public`))).status, 403, 'part playback inherits creator-cookie-independent public authorization');
+  assert.equal((await put(6, lastLength)).status, 204, 'identical part replay remains safe after the manifest is sealed');
+});
+
+test('concurrent writes to one upload part admit one writer and preserve the first body', async t => {
+  const { handle, req, runtime, repository } = await setup(t);
+  const upload = await (await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: MAX_SINGLE_UPLOAD_BYTES + 1 } }))).json();
+  const originalFetch = runtime.capabilityFetch;
+  let signalEntered!: () => void;
+  const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  runtime.capabilityFetch = async request => {
+    if (request.method === 'PUT') { signalEntered(); await blocked; }
+    return originalFetch(request);
+  };
+  const put = () => handle(req(`${upload.uploadUrl}&part=0`, { method: 'PUT', body: patternedStream(UPLOAD_CHUNK_BYTES), headers: upload.headers }));
+  const first = put();
+  await entered;
+  try { assert.equal((await put()).status, 409); }
+  finally { release(); }
+  assert.equal((await first).status, 204);
+  assert.equal((await repository.getPart(upload.id, 0))?.uploadState, 'ready');
+  assert.equal((await handle(req(`/api/recordings/${upload.id}/complete`, { value: { uploadId: upload.uploadId } }))).status, 202);
+});
+
+test('a part interrupted before its full fixed-length body safely resumes with the same reservation', async t => {
+  const { handle, req, runtime, repository } = await setup(t);
+  const upload = await (await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: MAX_SINGLE_UPLOAD_BYTES + 1 } }))).json();
+  const original = runtime.capabilityFetch;
+  runtime.capabilityFetch = async request => {
+    const reader = request.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+    throw new Error('Simulated disconnect before the complete fixed-length body');
+  };
+  const put = () => handle(req(`${upload.uploadUrl}&part=0`, { method: 'PUT', body: patternedStream(UPLOAD_CHUNK_BYTES), headers: upload.headers }));
+  const interrupted = await put();
+  assert.equal(interrupted.status, 502);
+  assert.equal((await interrupted.json()).code, 'storage_transfer_unavailable');
+  const pending = await repository.getPart(upload.id, 0);
+  assert.equal(pending?.uploadAttempted, false);
+  assert.equal(pending?.uploadSha256, null);
+  runtime.capabilityFetch = original;
+  assert.equal((await put()).status, 204);
+  assert.equal((await repository.getPart(upload.id, 0))?.uploadState, 'ready');
 });
