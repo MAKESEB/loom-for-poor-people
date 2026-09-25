@@ -87,21 +87,17 @@ function Login({ onSuccess, modal = false, onClose }: { onSuccess: () => void; m
 
   const content = <div className="login-card">
     {modal && <Button variant="ghost" size="icon" className="dialog-close" onClick={onClose} aria-label="Close sign in"><X /></Button>}
-    <div className="login-symbol"><LockKeyhole size={22} strokeWidth={1.5} /></div>
-    <p className="eyebrow">A LITTLE LESS FRICTION</p>
-    <h1>{modal ? 'Welcome back.' : 'Let’s make it clear.'}</h1>
-    <p className="login-description">{modal ? 'Sign in again. Your recording is still here.' : 'Your screen, a link, and a little less explaining.'}</p>
+    {modal ? <h2 id="session-login-title">Sign in</h2> : <h1 className="sr-only">Sign in</h1>}
     <form onSubmit={(event) => void submit(event)}>
       <label htmlFor={modal ? 'session-access-code' : 'access-code'}>Access code</label>
-      <Input id={modal ? 'session-access-code' : 'access-code'} ref={field} type="password" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Enter your UUID" autoComplete="current-password" autoCapitalize="none" spellCheck={false} required maxLength={100} aria-invalid={!!error} aria-describedby={error ? 'login-error' : undefined} disabled={busy} />
+      <Input id={modal ? 'session-access-code' : 'access-code'} ref={field} type="password" value={code} onChange={(event) => setCode(event.target.value)} placeholder="UUID" autoComplete="current-password" autoCapitalize="none" spellCheck={false} required maxLength={100} aria-invalid={!!error} aria-describedby={error ? 'login-error' : undefined} disabled={busy} />
       {error && <p className="field-error" id="login-error" role="alert">{error}</p>}
-      <Button className="login-submit" type="submit" disabled={busy || !code.trim()}>{busy ? <Spinner label="Signing in…" /> : <>Let me in <ArrowRight /></>}</Button>
+      <Button className="login-submit" type="submit" disabled={busy || !code.trim()}>{busy ? <Spinner label="Signing in…" /> : <>Continue <ArrowRight /></>}</Button>
     </form>
-    <p className="login-footnote">One code. Your little recording studio.</p>
   </div>;
 
-  if (modal) return <dialog ref={dialog} className="login-dialog" aria-label="Sign in again" onCancel={(event) => { event.preventDefault(); onClose?.(); }}>{content}</dialog>;
-  return <><Header /><main className="login-main page-width">{content}</main><Footer /></>;
+  if (modal) return <dialog ref={dialog} className="login-dialog" aria-labelledby="session-login-title" onCancel={(event) => { event.preventDefault(); onClose?.(); }}>{content}</dialog>;
+  return <><Header /><main className="login-main page-width">{content}</main></>;
 }
 
 function CopyButton({ text, label = 'Copy link', variant = 'default', onUnavailable }: { text: string; label?: string; variant?: 'default' | 'ghost' | 'outline'; onUnavailable?: () => void }) {
