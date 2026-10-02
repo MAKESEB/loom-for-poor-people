@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { after, before, beforeEach, describe, test } from 'node:test';
 import { createLocalRepository } from '../src/dev/repository';
 import { createRepository, type QueryClient } from '../src/server/repository';
-import { MAX_RECORDING_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
+import { MAX_SINGLE_UPLOAD_BYTES, POSTGRES_MAX_PART_COUNT, POSTGRES_MAX_RECORDING_BYTES as MAX_RECORDING_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import type { JobStatus, RecordingRow } from '../src/server/types';
 
 function recordingInput(): RecordingRow {
@@ -146,6 +146,11 @@ describe('repository against the real Postgres migration', () => {
     for (const sizeBytes of [0, MAX_RECORDING_BYTES + 1]) {
       await assert.rejects(local.repository.createRecording({ ...recordingInput(), sizeBytes }));
     }
+    await assert.rejects(local.repository.createRecording({ ...recordingInput(), sizeBytes: 10 * MAX_RECORDING_BYTES }), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'recording_too_large', 'the Postgres schema keeps 1 GiB, 128 parts');
+      assert.equal((error as { status?: number }).status, 413);
+      return true;
+    });
   });
 
   test('part manifests derive immutable keys and exact sizes from the recording reservation', async () => {
@@ -161,7 +166,7 @@ describe('repository against the real Postgres migration', () => {
     assert.equal(last.sizeBytes, record.sizeBytes - (record.partCount! - 1) * UPLOAD_CHUNK_BYTES);
     assert.equal(last.objectKey, `recordings/${record.id}/parts/000006`);
     assert.deepEqual((await local.repository.listParts(record.id)).map(part => part.index), [0, 6]);
-    for (const index of [-1, record.partCount!, 128, 1.5, NaN]) {
+    for (const index of [-1, record.partCount!, POSTGRES_MAX_PART_COUNT, 1.5, NaN]) {
       assert.equal(await local.repository.createPart(record.id, index), null);
     }
     const single = await local.repository.createRecording(recordingInput());

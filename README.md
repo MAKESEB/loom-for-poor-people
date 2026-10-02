@@ -24,7 +24,7 @@ Local development uses disk-backed private files in `.local/storage` and embedde
 
 - Desktop screen, window or tab recording, optional microphone and browser-supported screen audio.
 - Pause/resume, automatic upload when stopped, and local download if an upload needs retrying.
-- No fixed duration stop; up to 1 GiB per recording. Available browser storage can reduce that cap; the displayed limit reflects it. Browsers without private file storage and Web Locks use a 128 MiB fallback.
+- No fixed duration stop; up to 10 GiB per recording on Cloudflare, and up to 1 GiB on ohmyho.st and in local `npm run dev` (see [Hosting on ohmyho.st](#hosting-on-ohmyhost)). Available browser storage can reduce that cap; the displayed limit reflects it. Browsers without private file storage and Web Locks use a 128 MiB fallback.
 - Unlisted `/v/<uuid>` is always read-only, including when the creator opens it. Authenticated `/manage/<uuid>` contains the sharing and Markdown controls. Successful uploads open that management page; the copied link always points to the recipient page.
 - **Protect link** requires a permanent per-video token for metadata, playback, seeking and Markdown/downloads. It is access control, not end-to-end encryption.
 - **Generate Markdown** is separate from recording capacity and currently accepts videos up to 50 MiB. Larger videos can still be recorded, watched, downloaded and shared; management shows the AI limit. Only pressing **Generate** sends a video to Gemini. An empty goal produces a briefing; a custom goal can request a transcript or another format.
@@ -64,6 +64,8 @@ Server settings, installed through the hosting CLI's stdin-only secret workflow 
 
 Keep the access/share secrets compatible between environments because videos and settings are shared. Browser cookies remain host-bound. Test writes and migrations affect shared data. Keep schema changes additive and verify existing links before promotion.
 
+Recordings on ohmyho.st stay limited to 1 GiB (128 parts). The Postgres CHECK constraints on the recording size, part count and part index would have to be relaxed for more, which the hosting's additive-only migration contract does not allow; the Cloudflare schema (`migrations-d1/`) allows 10 GiB.
+
 The larger-recording migration adds effective `full_size_bytes` and `full_duration_seconds` columns because the hosting migration contract does not allow dropping the old CHECK constraints. Legacy columns retain bounded compatibility values; the repository reads the full fields when present. Existing single-object recordings remain unchanged. New multipart recordings need the compatible backend on both environments: promote it before sharing Dev-created multipart records through production, and do not roll back to a pre-multipart artifact once large videos exist.
 
 Follow the official [deployment workflow](https://ohmyho.st/skills/ohmyhost-deploy-github/SKILL.md): inspect, link the exact pushed GitHub commit, review its plan, deploy Dev, verify its protected URL, then promote the same artifact. A successful build or root HTTP response alone is not application verification.
@@ -75,7 +77,7 @@ Slop Rooster also runs as one Cloudflare Worker on your own account: Workers sta
 ### Prerequisites
 
 - A Cloudflare account with R2 enabled (the dashboard asks once before the first bucket).
-- The **Workers Paid** plan. On Workers Free, a request may use only 10 ms of CPU time and 50 subrequests, and calls to R2 and D1 count as subrequests. Every upload is verified with SHA-256, about 35 ms of CPU per 8 MiB part and roughly 0.2 s for a 50 MiB upload, and playing a recording above 50 MiB reads its 8 MiB parts from R2 (up to about 384 R2 operations for 1 GiB). Workers Paid allows 30 seconds of CPU per request by default and 10,000 subrequests; cron runs every five minutes get 30 seconds of CPU. Check the current numbers in [Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
+- The **Workers Paid** plan. On Workers Free, a request may use only 10 ms of CPU time and 50 subrequests, and calls to R2 and D1 count as subrequests. Every upload is verified with SHA-256, about 35 ms of CPU per 8 MiB part and roughly 0.2 s for a 50 MiB upload, and playing a recording above 50 MiB reads its 8 MiB parts from R2 (about three R2 operations per part, so close to 4,000 for a full 10 GiB download). Workers Paid allows 30 seconds of CPU per request by default and 10,000 subrequests; cron runs every five minutes get 30 seconds of CPU. Check the current numbers in [Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
 - Node.js 22.13 or later and npm 10.9.8.
 
 ### Deploy with the button

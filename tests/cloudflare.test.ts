@@ -7,7 +7,7 @@ import type { CloudflareEnvLike } from '../src/server/cloudflare-types';
 import { createD1Repository } from '../src/server/d1-repository';
 import type { GeminiClient } from '../src/server/gemini';
 import { StorageUnavailableError } from '../src/server/storage';
-import { MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
+import { MAX_PART_COUNT, MAX_RECORDING_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import { D1_MIGRATIONS } from './helpers/local-d1';
 import { createMemoryR2 } from './helpers/memory-r2';
 
@@ -169,6 +169,27 @@ test('recordings above the single-upload limit upload as 8 MiB R2 parts and seek
   assert.deepEqual(new Uint8Array(await ranged.arrayBuffer()), bytes.slice(offset, offset + 53));
   const suffix = await app.fetch(req(recording.videoUrl, { headers: { range: 'bytes=-31' }, anonymous: true }));
   assert.deepEqual(new Uint8Array(await suffix.arrayBuffer()), bytes.slice(size - 31));
+});
+
+test('Cloudflare accepts recordings up to 10 GiB, stored as up to 1,280 parts', async t => {
+  const { app, req, signIn, bucket } = await setup(t);
+  assert.equal((await json<{ maxBytes: number }>(app.fetch(req('/api/config')))).maxBytes, MAX_RECORDING_BYTES);
+  await signIn();
+  const details = { title: 'Ten gigabytes', contentType: 'video/webm', durationSeconds: 36_000 };
+  const tooLarge = await app.fetch(req('/api/recordings/uploads', { value: { ...details, id: crypto.randomUUID(), sizeBytes: MAX_RECORDING_BYTES + 1 } }));
+  assert.equal(tooLarge.status, 413);
+  assert.deepEqual(await tooLarge.json(), { error: 'Recordings must be 10 GiB or smaller.', code: 'recording_too_large' });
+  const reservation = await app.fetch(req('/api/recordings/uploads', { value: { ...details, id: crypto.randomUUID(), sizeBytes: MAX_RECORDING_BYTES } }));
+  assert.equal(reservation.status, 201, await reservation.clone().text());
+  const upload = await json<UploadBody>(reservation);
+  assert.equal(upload.partCount, MAX_PART_COUNT);
+  // The last part's index is far beyond the former 128-part schema limit.
+  const last = MAX_PART_COUNT - 1;
+  const bytes = new Uint8Array(UPLOAD_CHUNK_BYTES).fill(7);
+  const put = await app.fetch(req(`${upload.uploadUrl}&part=${last}`, { method: 'PUT', body: bytes.buffer, headers: upload.headers }));
+  assert.equal(put.status, 204, await put.clone().text());
+  assert(bucket.objects.has(`recordings/${upload.id}/parts/001279`));
+  assert.equal((await app.fetch(req(`${upload.uploadUrl}&part=${MAX_PART_COUNT}`, { method: 'PUT', body: bytes.buffer, headers: upload.headers }))).status, 400);
 });
 
 test('Markdown jobs read the video from R2; the scheduled run completes queued work before it resolves', async t => {

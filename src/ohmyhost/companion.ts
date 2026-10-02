@@ -3,6 +3,7 @@ import { resolveAuthConfig } from '../server/auth';
 import { createJobService } from '../server/jobs';
 import { resolveRepository } from '../server/repository';
 import { resolveStorageRuntime } from '../server/storage';
+import { POSTGRES_MAX_RECORDING_BYTES } from '../shared/policy';
 
 interface ExecutionContext { waitUntil(task: Promise<unknown>): void }
 
@@ -26,6 +27,7 @@ export default {
     return createApiHandler(() => get().storage, {
       repository: () => get().repository,
       auth: () => resolveAuthConfig(environment),
+      maxRecordingBytes: POSTGRES_MAX_RECORDING_BYTES,
       ...(environment.GEMINI_API_KEY ? { markdown: () => get().markdown! } : {}),
     })(request);
   },

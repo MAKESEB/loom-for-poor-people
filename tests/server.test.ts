@@ -3,7 +3,7 @@ import { test, type TestContext } from 'node:test';
 import { createLocalRepository } from '../src/dev/repository';
 import type { MarkdownService } from '../src/server/types';
 import { createApiHandler, MAX_DURATION_SECONDS, MAX_VIDEO_BYTES } from '../src/server/api';
-import { MAX_MARKDOWN_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
+import { MAX_MARKDOWN_BYTES, MAX_SINGLE_UPLOAD_BYTES, POSTGRES_MAX_PART_COUNT, POSTGRES_MAX_RECORDING_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import { resolveStorageRuntime, StorageUnavailableError, storageBindingDiagnostics, type ManagedStorage, type StorageRuntime } from '../src/server/storage';
 
 const ORIGIN = 'https://app.test';
@@ -116,7 +116,8 @@ async function setup(t: TestContext, markdown?: MarkdownService) {
   const local = await createLocalRepository('memory://');
   t.after(() => local.close());
   const fake = fakeRuntime();
-  const handle = createApiHandler(fake.runtime, { repository: local.repository, auth: AUTH, markdown });
+  // Like ohmyho.st and `npm run dev`, these tests run the Postgres schema and its recording limit.
+  const handle = createApiHandler(fake.runtime, { repository: local.repository, auth: AUTH, markdown, maxRecordingBytes: POSTGRES_MAX_RECORDING_BYTES });
   const login = await handle(new Request(`${ORIGIN}/api/session`, { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ accessCode: AUTH.accessUuid }) }));
   assert.equal(login.status, 200);
   const cookie = login.headers.get('set-cookie')!.split(';')[0];
@@ -454,20 +455,29 @@ function expectedPattern(length: number, start: number) {
   return Uint8Array.from({ length }, (_, index) => (start + index) % 251);
 }
 
-test('configuration separates 1 GiB recordings and 50 MiB Markdown with no independent duration cap', async t => {
+test('configuration separates 1 GiB Postgres recordings and 50 MiB Markdown with no independent duration cap', async t => {
   const { handle, req, repository, transfers } = await setup(t);
   const config = await (await handle(req('/api/config'))).json();
   assert.equal(config.maxBytes, 1024 * 1024 * 1024);
+  assert.equal(MAX_VIDEO_BYTES, 10 * 1024 * 1024 * 1024, 'the application maximum (Cloudflare) is 10 GiB');
   assert.equal(config.maxDurationSeconds, null);
   assert.equal(MAX_DURATION_SECONDS, null);
   assert.equal(config.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
-  const large = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: MAX_VIDEO_BYTES, durationSeconds: 24 * 60 * 60 } }));
+  const large = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: POSTGRES_MAX_RECORDING_BYTES, durationSeconds: 24 * 60 * 60 } }));
   assert.equal(large.status, 201, await large.clone().text());
   const reservation = await large.json();
   assert.equal(reservation.chunkSizeBytes, UPLOAD_CHUNK_BYTES);
-  assert.equal(reservation.partCount, 128);
+  assert.equal(reservation.partCount, POSTGRES_MAX_PART_COUNT);
+  const tooLarge = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, id: crypto.randomUUID(), sizeBytes: POSTGRES_MAX_RECORDING_BYTES + 1 } }));
+  assert.equal(tooLarge.status, 413);
+  assert.deepEqual(await tooLarge.json(), { error: 'Recordings must be 1 GiB or smaller.', code: 'recording_too_large' });
+  // Without the option, the Postgres repository still refuses what its schema cannot hold.
+  const unconfigured = createApiHandler(fakeRuntime().runtime, { repository, auth: AUTH });
+  const refused = await unconfigured(req('/api/recordings/uploads', { value: { ...DETAILS, id: crypto.randomUUID(), sizeBytes: 2 * POSTGRES_MAX_RECORDING_BYTES } }));
+  assert.equal(refused.status, 413);
+  assert.deepEqual(await refused.json(), { error: 'Recordings must be 1 GiB or smaller.', code: 'recording_too_large' });
   const row = await repository.getRecording(reservation.id);
-  assert.equal(row?.sizeBytes, MAX_VIDEO_BYTES);
+  assert.equal(row?.sizeBytes, POSTGRES_MAX_RECORDING_BYTES);
   assert.equal(row?.durationSeconds, 86400);
   assert.equal(row?.storageMode, 'parts');
   assert.equal(transfers.size, 0, 'a large reservation never reserves a single oversized provider PUT');

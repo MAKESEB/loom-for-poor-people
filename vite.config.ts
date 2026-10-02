@@ -8,6 +8,7 @@ import { createLocalRepository } from './src/dev/repository';
 import { createApiHandler } from './src/server/api';
 import { resolveAuthConfig } from './src/server/auth';
 import { createJobService } from './src/server/jobs';
+import { POSTGRES_MAX_RECORDING_BYTES } from './src/shared/policy';
 
 function localApi(environment: Record<string, string>): Plugin {
   return {
@@ -27,6 +28,8 @@ function localApi(environment: Record<string, string>): Plugin {
       }) : undefined;
       const handleApi = createApiHandler(storage, {
         repository: local.repository, auth: () => resolveAuthConfig(environment), markdown,
+        // Local development runs the Postgres schema (PGlite), like ohmyho.st hosting.
+        maxRecordingBytes: POSTGRES_MAX_RECORDING_BYTES,
       });
       const timer = setInterval(() => {
         void markdown?.runPending().catch(() => server.config.logger.error('Background recovery will retry.'));

@@ -1,4 +1,4 @@
-import { MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../shared/policy';
+import { MAX_PART_COUNT, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../shared/policy';
 import type { D1DatabaseLike, D1Value } from './cloudflare-types';
 import type { JobPatch, MarkdownJob, RecordingPart, RecordingRow, Repository } from './types';
 
@@ -87,7 +87,7 @@ export function createD1Repository(db: D1DatabaseLike): Repository {
         [uuid(id), flag(patch.protected), flag(patch.markdownEnabled)]));
     },
     async createPart(recordingId, index) {
-      if (!Number.isInteger(index) || index < 0 || index >= 128) return null;
+      if (!Number.isInteger(index) || index < 0 || index >= MAX_PART_COUNT) return null;
       const id = uuid(recordingId);
       // The parent predicate and the insert are one atomic statement (the Postgres FOR UPDATE lock).
       const created = await part(`INSERT INTO slop_recording_parts (recording_id, part_index, size_bytes, object_key)

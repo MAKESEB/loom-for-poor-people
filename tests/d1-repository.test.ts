@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, beforeEach, describe, test } from 'node:test';
@@ -9,7 +9,7 @@ import { resolveD1Repository } from '../src/server/cloudflare';
 import type { D1Value } from '../src/server/cloudflare-types';
 import { createD1Repository } from '../src/server/d1-repository';
 import { DatabaseUnavailableError } from '../src/server/repository';
-import { MAX_RECORDING_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
+import { MAX_PART_COUNT, MAX_RECORDING_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../src/shared/policy';
 import type { JobStatus, RecordingRow } from '../src/server/types';
 import { createLocalD1Repository as createLocalRepository, D1_MIGRATIONS as MIGRATIONS } from './helpers/local-d1';
 
@@ -186,7 +186,7 @@ describe('repository against the real D1 migration (node:sqlite)', () => {
     assert(lastIndex > 1);
     assert.equal(last.objectKey, `recordings/${record.id}/parts/${String(lastIndex).padStart(6, '0')}`);
     assert.deepEqual((await local.repository.listParts(record.id)).map(part => part.index), [0, lastIndex]);
-    for (const index of [-1, record.partCount!, 128, 1.5, NaN]) {
+    for (const index of [-1, record.partCount!, MAX_PART_COUNT, 1.5, NaN]) {
       assert.equal(await local.repository.createPart(record.id, index), null);
     }
     const single = await local.repository.createRecording(recordingInput());
@@ -194,7 +194,8 @@ describe('repository against the real D1 migration (node:sqlite)', () => {
     assert.equal(await local.repository.createPart(randomUUID(), 0), null);
     assert.equal(await local.repository.getPart(record.id, 1), null);
     const largest = await multipartRecording(MAX_RECORDING_BYTES);
-    assert.equal((await local.repository.createPart(largest.id, 127))?.sizeBytes, UPLOAD_CHUNK_BYTES);
+    assert.equal(largest.partCount, MAX_PART_COUNT);
+    assert.equal((await local.repository.createPart(largest.id, MAX_PART_COUNT - 1))?.sizeBytes, UPLOAD_CHUNK_BYTES);
   });
 
   test('part leases fence every data mutation across expired owners and same-owner reclaims', async () => {
@@ -487,6 +488,44 @@ describe('the D1 migration', () => {
     }
   });
 
+  test('0002 rebuilds recordings and parts for 10 GiB without losing rows or foreign keys', async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'slop-rooster-0002-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await copyFile(new URL('0001_init.sql', MIGRATIONS), join(directory, '0001_init.sql'));
+    const database = createSqliteD1();
+    t.after(() => database.close());
+    await applyMigrations(database, directory);
+    const before = createD1Repository(database);
+    const multipart = await before.createRecording({ ...recordingInput(), sizeBytes: MAX_SINGLE_UPLOAD_BYTES + 1 });
+    assert(await before.createPart(multipart.id, 0));
+    assert(await before.createPart(multipart.id, 6));
+    const single = await before.createRecording(recordingInput());
+    await before.attachTransfer(single.id, 'transfer-single');
+    await before.completeRecording(single.id);
+    const job = (await before.createJob({ id: randomUUID(), requestId: randomUUID(), recordingId: single.id, goal: 'Survive the rebuild.' })).job;
+    const rowsOf = async (table: string) => (await database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()).results;
+    const snapshot = { recordings: await rowsOf('slop_recordings'), parts: await rowsOf('slop_recording_parts'), jobs: await rowsOf('slop_markdown_jobs') };
+    await assert.rejects(before.createRecording({ ...recordingInput(), sizeBytes: MAX_RECORDING_BYTES }), /CHECK/, '0001 still caps recordings at 1 GiB');
+
+    await applyMigrations(database, MIGRATIONS);
+    assert.deepEqual({ recordings: await rowsOf('slop_recordings'), parts: await rowsOf('slop_recording_parts'), jobs: await rowsOf('slop_markdown_jobs') }, snapshot);
+    const after = createD1Repository(database);
+    assert.deepEqual(await after.getJob(job.id), job);
+    assert.deepEqual(await after.getRecording(multipart.id), multipart);
+    assert.deepEqual((await database.prepare('PRAGMA foreign_key_check').all()).results, []);
+    await assert.rejects(after.createJob({ id: randomUUID(), requestId: randomUUID(), recordingId: randomUUID(), goal: 'g' }), /FOREIGN KEY/);
+    await assert.rejects(database.prepare('INSERT INTO slop_recording_parts (recording_id, part_index, size_bytes, object_key) VALUES (?1, 1, 1, ?2)').bind(randomUUID(), randomUUID()).run(), /FOREIGN KEY/);
+    await assert.rejects(database.prepare('DELETE FROM slop_recordings WHERE id = ?1').bind(multipart.id).run(), /FOREIGN KEY/, 'parts still pin their recording');
+    await assert.rejects(database.prepare('DELETE FROM slop_recordings WHERE id = ?1').bind(single.id).run(), /FOREIGN KEY/, 'jobs still pin their recording');
+    const indexes = (await database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'slop_%' ORDER BY name").all<{ name: string }>()).results.map(row => row.name);
+    assert.deepEqual(indexes, ['slop_jobs_due', 'slop_jobs_recording_created', 'slop_one_active_job']);
+    const large = await after.createRecording({ ...recordingInput(), sizeBytes: MAX_RECORDING_BYTES });
+    assert.equal(large.partCount, MAX_PART_COUNT);
+    assert.equal((await after.createPart(large.id, MAX_PART_COUNT - 1))?.objectKey, `recordings/${large.id}/parts/001279`);
+    await database.prepare("UPDATE slop_recordings SET upload_state = 'deleted' WHERE id = ?1").bind(single.id).run();
+    assert.equal((await after.getRecording(single.id))?.uploadState, 'deleted', "the 'deleted' state is allowed");
+  });
+
   test('keeps LIKE and GLOB patterns within the 50-byte D1 limit that node:sqlite does not enforce', async () => {
     const sources = [
       ...await Promise.all((await readdir(MIGRATIONS)).filter(name => name.endsWith('.sql')).map(name => readFile(new URL(name, MIGRATIONS), 'utf8'))),
@@ -518,12 +557,12 @@ describe('the D1 migration', () => {
       ['slop_recordings', recordingRow, 'upload_id', `${randomUUID()}0`], ['slop_recordings', recordingRow, 'id', null],
       ['slop_recordings', recordingRow, 'title', ''], ['slop_recordings', recordingRow, 'title', 'x'.repeat(101)],
       ['slop_recordings', recordingRow, 'content_type', 'video/ogg'],
-      ['slop_recordings', recordingRow, 'size_bytes', 0], ['slop_recordings', recordingRow, 'size_bytes', 1_073_741_825],
+      ['slop_recordings', recordingRow, 'size_bytes', 0], ['slop_recordings', recordingRow, 'size_bytes', MAX_RECORDING_BYTES + 1],
       ['slop_recordings', recordingRow, 'size_bytes', 'large'], ['slop_recordings', recordingRow, 'duration_seconds', -0.5],
       ['slop_recordings', recordingRow, 'upload_state', 'done'], ['slop_recordings', recordingRow, 'protected', 2],
       ['slop_recordings', recordingRow, 'markdown_enabled', -1], ['slop_recordings', recordingRow, 'storage_mode', 'multi'],
       ['slop_recordings', recordingRow, 'chunk_size_bytes', 8_388_609], ['slop_recordings', recordingRow, 'part_count', 0],
-      ['slop_recordings', recordingRow, 'part_count', 129], ['slop_recordings', recordingRow, 'upload_sha256', 'A'.repeat(64)],
+      ['slop_recordings', recordingRow, 'part_count', MAX_PART_COUNT + 1], ['slop_recordings', recordingRow, 'upload_sha256', 'A'.repeat(64)],
       ['slop_recordings', recordingRow, 'upload_sha256', 'a'.repeat(63)], ['slop_recordings', recordingRow, 'upload_sha256', 'g'.repeat(64)],
       ['slop_recordings', recordingRow, 'created_at', '2026-09-25 10:00:00'], ['slop_recordings', recordingRow, 'upload_lease_until', '2026-09-25T10:00:00Z'],
       ['slop_recordings', recordingRow, 'upload_attempted_at', 'yesterday'],
@@ -531,7 +570,7 @@ describe('the D1 migration', () => {
       ['slop_markdown_jobs', jobRow, 'goal', 'x'.repeat(4001)], ['slop_markdown_jobs', jobRow, 'cleanup_pending', 2],
       ['slop_markdown_jobs', jobRow, 'next_run_at', 'soon'], ['slop_markdown_jobs', jobRow, 'deadline_at', '2026-09-25'],
       ['slop_markdown_jobs', jobRow, 'lease_until', '2026-09-25T10:00:00'], ['slop_markdown_jobs', jobRow, 'attempts', 1.5],
-      ['slop_recording_parts', partRow, 'part_index', 128], ['slop_recording_parts', partRow, 'part_index', -1],
+      ['slop_recording_parts', partRow, 'part_index', MAX_PART_COUNT], ['slop_recording_parts', partRow, 'part_index', -1],
       ['slop_recording_parts', partRow, 'size_bytes', 0], ['slop_recording_parts', partRow, 'size_bytes', 8_388_609],
       ['slop_recording_parts', partRow, 'transfer_id', ''], ['slop_recording_parts', partRow, 'upload_sha256', 'F'.repeat(64)],
       ['slop_recording_parts', partRow, 'upload_state', 'uploaded'], ['slop_recording_parts', partRow, 'lease_until', 'later'],

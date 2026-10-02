@@ -1,5 +1,5 @@
 import { createPrivateDatabaseClient, type CustomerDatabaseClient } from '@ohmyhost/customer-runtime/database';
-import { MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES } from '../shared/policy';
+import { limitText, MAX_SINGLE_UPLOAD_BYTES, POSTGRES_MAX_PART_COUNT, POSTGRES_MAX_RECORDING_BYTES, UPLOAD_CHUNK_BYTES } from '../shared/policy';
 import type { JobPatch, MarkdownJob, RecordingPart, RecordingRow, Repository } from './types';
 
 export type QueryClient = Pick<CustomerDatabaseClient, 'query'>;
@@ -52,6 +52,10 @@ export function createRepository(client: QueryClient): Repository {
   const required = <T>(value: T | null) => { if (value === null) throw new Error('The requested database record is unavailable.'); return value; };
   return {
     async createRecording(input) {
+      // The schema's CHECK constraints hold 1 GiB and 128 parts; answer clearly instead of with a constraint error.
+      if (input.sizeBytes > POSTGRES_MAX_RECORDING_BYTES) {
+        throw Object.assign(new Error(`Recordings must be ${limitText(POSTGRES_MAX_RECORDING_BYTES)} or smaller.`), { code: 'recording_too_large', status: 413 });
+      }
       const multipart = input.sizeBytes > MAX_SINGLE_UPLOAD_BYTES;
       return required(await recording(`INSERT INTO slop_recordings
         (id, request_id, upload_id, title, content_type, size_bytes, duration_seconds, created_at, object_key, upload_attempted_at,
@@ -83,7 +87,7 @@ export function createRepository(client: QueryClient): Repository {
       return required(await recording('UPDATE slop_recordings SET protected = COALESCE($2::boolean, protected), markdown_enabled = COALESCE($3::boolean, markdown_enabled) WHERE id = $1 RETURNING *', [id, patch.protected ?? null, patch.markdownEnabled ?? null]));
     },
     async createPart(recordingId, index) {
-      if (!Number.isInteger(index) || index < 0 || index >= 128) return null;
+      if (!Number.isInteger(index) || index < 0 || index >= POSTGRES_MAX_PART_COUNT) return null;
       const created = await part(`WITH parent AS MATERIALIZED (
         SELECT id, full_size_bytes, chunk_size_bytes, part_count FROM slop_recordings
         WHERE id = $1 AND storage_mode = 'parts' AND upload_state = 'pending' AND $2::integer < part_count FOR UPDATE

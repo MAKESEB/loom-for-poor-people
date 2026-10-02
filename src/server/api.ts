@@ -3,7 +3,7 @@ import { AuthUnavailableError, clearSessionCookie, createSessionCookie, hasSessi
 import { DatabaseUnavailableError } from './repository';
 import { fixedLengthBody, StorageUnavailableError, type StorageRuntime } from './storage';
 import { RecordingStorageError, streamMultipartRecording } from './recording-storage';
-import { MAX_RECORDING_BYTES, MAX_MARKDOWN_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES, MAX_DURATION_SECONDS } from '../shared/policy';
+import { MAX_RECORDING_BYTES, MAX_MARKDOWN_BYTES, MAX_SINGLE_UPLOAD_BYTES, UPLOAD_CHUNK_BYTES, MAX_DURATION_SECONDS, limitText } from '../shared/policy';
 import type { MarkdownService, MarkdownView, RecordingPart, RecordingRow, Repository } from './types';
 
 export const MAX_VIDEO_BYTES = MAX_RECORDING_BYTES;
@@ -20,6 +20,11 @@ export interface ApiOptions {
   now?: () => Date;
   randomUUID?: () => string;
   storageDiagnostics?: () => unknown;
+  /**
+   * The largest recording this deployment accepts, at most MAX_VIDEO_BYTES (the default, used on
+   * Cloudflare). The Postgres schema (ohmyho.st, `npm run dev`) holds POSTGRES_MAX_RECORDING_BYTES.
+   */
+  maxRecordingBytes?: number;
 }
 
 export interface RecordingMetadata {
@@ -55,6 +60,7 @@ function resolve<T>(value: Resolvable<T>): T { return typeof value === 'function
 export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: ApiOptions) {
   const randomUUID = options.randomUUID ?? (() => crypto.randomUUID());
   const now = options.now ?? (() => new Date());
+  const maxRecordingBytes = Math.min(options.maxRecordingBytes ?? MAX_VIDEO_BYTES, MAX_VIDEO_BYTES);
 
   return async function handleApiRequest(request: Request): Promise<Response> {
     try {
@@ -62,7 +68,7 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
       if (url.pathname === '/api/config' && request.method === 'GET') {
         let configured = true;
         try { resolve(runtime); resolve(options.repository); resolve(options.auth); } catch { configured = false; }
-        return json({ maxBytes: MAX_VIDEO_BYTES, maxDurationSeconds: MAX_DURATION_SECONDS, maxMarkdownBytes: MAX_MARKDOWN_BYTES, configured });
+        return json({ maxBytes: maxRecordingBytes, maxDurationSeconds: MAX_DURATION_SECONDS, maxMarkdownBytes: MAX_MARKDOWN_BYTES, configured });
       }
       const auth = resolve(options.auth);
       let owner = await hasSession(request, auth, now());
@@ -83,7 +89,7 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
       if (url.pathname === '/api/recordings/uploads') {
         requireMethod(request, 'POST');
         assertWrite(request, owner);
-        const input = parseUploadInput(await readRequestJson(request));
+        const input = parseUploadInput(await readRequestJson(request), maxRecordingBytes);
         const id = randomUUID();
         let recording = await repository.createRecording({
           id, requestId: input.requestId ?? randomUUID(), uploadId: randomUUID(), title: input.title,
@@ -220,6 +226,8 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
       if (code === 'storage_quota_exceeded') return json({ error: 'Storage is full. Your recording has not been shared.', code }, 507);
       if (code === 'storage_upload_expired') return json({ error: 'This upload expired. Please upload your recording again.', code }, 409);
       if (code === 'request_conflict') return json({ error: 'This generation request was already used with a different goal.', code }, 409);
+      // The repository's own, smaller limit (the Postgres schema) wins over the configured one.
+      if (code === 'recording_too_large' && error instanceof Error) return json({ error: error.message, code }, 413);
       if (code === 'generation_busy') return json({ error: 'A generation is already being started. Please retry.', code }, 409);
       return json({ error: 'This request could not be completed. Please try again.', code: 'request_failed' }, 502);
     }
@@ -541,13 +549,13 @@ async function readBoundedText(request: Request) {
   } finally { reader.releaseLock(); }
 }
 
-function parseUploadInput(value: unknown): UploadInput {
+function parseUploadInput(value: unknown, maxRecordingBytes: number): UploadInput {
   if (!isObject(value)) throw new ApiError(400, 'invalid_recording', 'Recording details are required.');
   if (value.id !== undefined && !isUuid(value.id)) throw new ApiError(400, 'invalid_request_id', 'A valid upload request ID is required.');
   if (typeof value.title !== 'string' || !value.title.trim() || value.title.trim().length > 100 || /[\u0000-\u001f\u007f]/.test(value.title)) throw new ApiError(400, 'invalid_title', 'Use a recording title between 1 and 100 characters.');
   if (typeof value.contentType !== 'string' || !VIDEO_TYPES.has(value.contentType)) throw new ApiError(415, 'invalid_video_type', 'Only WebM and MP4 recordings are supported.');
   if (!Number.isSafeInteger(value.sizeBytes) || Number(value.sizeBytes) < 1) throw new ApiError(400, 'invalid_size', 'The recording must contain video data.');
-  if (Number(value.sizeBytes) > MAX_VIDEO_BYTES) throw new ApiError(413, 'recording_too_large', 'Recordings must be 1 GiB or smaller.');
+  if (Number(value.sizeBytes) > maxRecordingBytes) throw new ApiError(413, 'recording_too_large', `Recordings must be ${limitText(maxRecordingBytes)} or smaller.`);
   if (typeof value.durationSeconds !== 'number' || !Number.isFinite(value.durationSeconds) || value.durationSeconds < 0) throw new ApiError(400, 'invalid_duration', 'Use a finite, nonnegative recording duration.');
   return { ...(value.id ? { requestId: String(value.id).toLowerCase() } : {}), title: value.title.trim(), contentType: value.contentType, sizeBytes: Number(value.sizeBytes), durationSeconds: value.durationSeconds };
 }
