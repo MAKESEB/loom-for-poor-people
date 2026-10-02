@@ -4,7 +4,7 @@ import { createLocalRepository } from '../src/dev/repository';
 import { GeminiError, type GeminiClient, type GeminiFile, type GeminiInteraction } from '../src/server/gemini';
 import { createJobService } from '../src/server/jobs';
 import type { StorageRuntime } from '../src/server/storage';
-import type { RecordingRow, Repository } from '../src/server/types';
+import type { RecordingPart, RecordingRow, Repository } from '../src/server/types';
 import { MAX_MARKDOWN_BYTES } from '../src/shared/policy';
 
 const bytes = new TextEncoder().encode('recorded video bytes');
@@ -328,7 +328,7 @@ test('oversized recordings reject Markdown before creating a job or starting any
       assert(error instanceof Error);
       assert.equal((error as Error & { code: string }).code, 'markdown_too_large');
       assert.equal((error as Error & { status: number }).status, 413);
-      assert.equal(error.message, 'Markdown generation is available for recordings up to 50 MiB.');
+      assert.equal(error.message, 'Markdown generation is available for recordings up to 64 MiB.');
       return true;
     },
   );
@@ -354,7 +354,7 @@ for (const inputMethod of ['files', 'inline'] as const) {
     await service.runPending();
     const job = await h.repository.getJob(id);
     assert.equal(job?.status, 'failed');
-    assert.equal(job?.error, 'Markdown generation is available for recordings up to 50 MiB.');
+    assert.equal(job?.error, 'Markdown generation is available for recordings up to 64 MiB.');
     assert.equal(job?.attempts, 0);
     assert.equal(job?.providerFileName, null);
     assert.equal(job?.interactionId, null);
@@ -364,7 +364,7 @@ for (const inputMethod of ['files', 'inline'] as const) {
   });
 }
 
-test('an exactly 50 MiB recording still creates a durable job for cron', async (t) => {
+test('a recording of exactly the 64 MiB Markdown limit still creates a durable job for cron', async (t) => {
   const h = await setup(t);
   let createCalls = 0;
   const repository: Repository = {
@@ -383,4 +383,87 @@ test('an exactly 50 MiB recording still creates a durable job for cron', async (
   assert.equal((await h.repository.listWork(4))[0]?.id, result.jobId);
   assert.equal(deferred.length, 0, 'maximum-size videos must use the longer cron execution window');
   assert.deepEqual(h.calls, []);
+});
+
+test('one cron run streams at most 128 MiB of recordings to Gemini; polling and cleanup are never held back', async (t) => {
+  const h = await setup(t);
+  const service = h.makeService('inline');
+  const size = 50 * 1024 * 1024;
+  const largeRecording = async () => {
+    const id = crypto.randomUUID();
+    await h.repository.createRecording({ ...h.recording, id, requestId: crypto.randomUUID(), uploadId: crypto.randomUUID(), objectKey: `videos/${id}.webm`, transferId: null });
+    await h.repository.attachTransfer(id, `transfer-${id}`);
+    await h.repository.completeRecording(id);
+    await h.database.query('UPDATE slop_recordings SET full_size_bytes=$2, markdown_enabled=true WHERE id=$1', [id, size]);
+    return (await h.repository.getRecording(id))!;
+  };
+
+  // A job that only polls Gemini for its result.
+  const polling = (await service.generate(h.recording, '', crypto.randomUUID())).jobId!;
+  await service.advance(polling);
+  assert.equal((await h.repository.getJob(polling))?.status, 'generating');
+  await h.due(polling);
+  const large: string[] = [];
+  for (let index = 0; index < 3; index++) large.push((await service.generate(await largeRecording(), '', crypto.randomUUID())).jobId!);
+  h.calls.length = 0;
+
+  assert.deepEqual(await service.runPending(), { processed: 3 });
+  assert.equal(h.calls.filter(call => call === 'get-interaction').length, 1, 'the poll runs regardless of the budget');
+  assert.equal(h.calls.filter(call => call === 'create').length, 2, 'two 50 MiB recordings fit the 128 MiB budget');
+  const [first, second, third] = await Promise.all(large.map(id => h.repository.getJob(id)));
+  assert.equal(first?.status, 'generating');
+  assert.equal(second?.status, 'generating');
+  assert.equal(third?.status, 'queued');
+  assert.equal(third?.attempts, 0);
+  assert.equal(third?.leaseVersion, 0, 'the job over budget is not even claimed');
+
+  await service.runPending();
+  assert.equal((await h.repository.getJob(large[2]))?.status, 'generating', 'the next run starts it');
+  assert.equal(h.calls.filter(call => call === 'create').length, 3);
+});
+
+test('a recording stored in parts streams to Gemini stitched together, in order and complete', async (t) => {
+  const h = await setup(t);
+  const video = Uint8Array.from({ length: 23 }, (_, index) => (index * 37 + 19) % 256);
+  const chunk = 8;
+  const recording: RecordingRow = { ...h.recording, sizeBytes: video.length, storageMode: 'parts', chunkSizeBytes: chunk, partCount: Math.ceil(video.length / chunk) };
+  const parts: RecordingPart[] = Array.from({ length: recording.partCount! }, (_, index) => ({
+    recordingId: recording.id, index, objectKey: `recordings/${recording.id}/parts/${index}`,
+    sizeBytes: Math.min(chunk, video.length - index * chunk), transferId: `transfer-${index}`, uploadSha256: 'a'.repeat(64),
+    uploadAttempted: true, uploadState: 'ready', leaseVersion: 1,
+  }));
+  const repository: Repository = {
+    ...h.repository,
+    async getRecording(id) { return id === recording.id ? { ...recording } : h.repository.getRecording(id); },
+    async listParts(id) { return id === recording.id ? parts.map(part => ({ ...part })) : []; },
+  };
+  const reads: string[] = [];
+  const runtime: StorageRuntime = {
+    storage: { ...h.runtime.storage, async createSignedRead(objectKey: string) {
+      return { url: `https://storage.example/${objectKey}`, requiredHeaders: {}, operation: 'GET', objectKey, expectedContentLength: null, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    } },
+    async capabilityFetch(request: Request) {
+      const index = Number(new URL(request.url).pathname.split('/').at(-1));
+      reads.push(String(index));
+      const bytes = video.slice(index * chunk, index * chunk + parts[index].sizeBytes);
+      const [, start, end] = /^bytes=(\d+)-(\d+)$/.exec(request.headers.get('range')!)!.map(Number);
+      return new Response(bytes.slice(start, end + 1), { status: 206, headers: { 'content-length': String(end - start + 1), 'content-range': `bytes ${start}-${end}/${bytes.length}` } });
+    },
+  };
+  let received: Uint8Array | null = null;
+  const client: GeminiClient = {
+    ...h.client,
+    async createInteraction(input) {
+      assert(input.inline, 'parted recordings use the verified inline path');
+      assert.equal(input.inline.sizeBytes, video.length);
+      received = new Uint8Array(await new Response(await input.inline.openBody(new AbortController().signal)).arrayBuffer());
+      return h.state.create;
+    },
+  };
+  const service = createJobService(repository, runtime, { apiKey: 'test-key', client, inputMethod: 'inline' });
+  const id = (await service.generate(recording, '', crypto.randomUUID())).jobId!;
+  await service.advance(id);
+  assert.deepEqual(received, video);
+  assert.deepEqual(reads, ['0', '1', '2']);
+  assert.equal((await h.repository.getJob(id))?.status, 'generating');
 });

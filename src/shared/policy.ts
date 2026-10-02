@@ -13,7 +13,12 @@ export const MAX_RECORDING_BYTES = 10 * 1024 * MIB;
  * additive-only migration contract.
  */
 export const POSTGRES_MAX_RECORDING_BYTES = 1024 * MIB;
-export const MAX_MARKDOWN_BYTES = 50 * MIB;
+/**
+ * Markdown jobs stream the video to Gemini as base64 inside one request, which Gemini
+ * accepts up to 100 MB. Base64 adds a third, so 64 MiB of video become ~89.5 MB.
+ * Parted recordings stream stitched together, like playback.
+ */
+export const MAX_MARKDOWN_BYTES = 64 * MIB;
 export const MAX_SINGLE_UPLOAD_BYTES = 50 * MIB;
 export const UPLOAD_CHUNK_BYTES = 8 * MIB;
 export const MAX_PART_COUNT = MAX_RECORDING_BYTES / UPLOAD_CHUNK_BYTES;

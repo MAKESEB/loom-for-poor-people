@@ -1,13 +1,23 @@
 import { createGeminiClient, GeminiError, type GeminiClient, type GeminiClientConfig, type GeminiFile, type GeminiInteraction } from './gemini';
+import { streamMultipartRecording } from './recording-storage';
 import type { StorageRuntime } from './storage';
 import type { JobPatch, MarkdownJob, MarkdownService, MarkdownView, RecordingRow, Repository } from './types';
-import { MAX_MARKDOWN_BYTES } from '../shared/policy';
+import { limitText, MAX_MARKDOWN_BYTES } from '../shared/policy';
 
 const LEASE_SECONDS = 240;
 const POLL_DELAY_MS = 5_000;
 const RETRY_DELAY_MS = 60_000;
 const MAX_DEFERRED_VIDEO_BYTES = 10 * 1024 * 1024;
-const MARKDOWN_SIZE_MESSAGE = 'Markdown generation is available for recordings up to 50 MiB.';
+/**
+ * One cron run starts streaming recordings to Gemini only while their total size stays
+ * within this budget (the first one always starts); the others stay due for the next
+ * run. Storage reads and the base64 request body stream at constant memory, so this
+ * keeps a burst of large jobs from all riding on one invocation (a killed invocation
+ * leaves its submissions 'uncertain'). Two maximum-size jobs per 5-minute run keep a
+ * queue well within the 30-minute job deadline.
+ */
+const MAX_STREAMED_BYTES_PER_RUN = 2 * MAX_MARKDOWN_BYTES;
+const MARKDOWN_SIZE_MESSAGE = `Markdown generation is available for recordings up to ${limitText(MAX_MARKDOWN_BYTES)}.`;
 const TERMINAL = new Set(['completed', 'failed', 'uncertain']);
 const UNKNOWN_MESSAGE = 'Gemini may have received this request, but its confirmation was lost. Generate again only if you want to start another attempt.';
 
@@ -141,11 +151,19 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
       }
 
       const openRecording = async (signal: AbortSignal) => {
-        const capability = await runtime.storage.createSignedRead(recording.objectKey);
-        if (signal.aborted) throw new GeminiError('storage_read_failed');
-        const response = await runtime.capabilityFetch(new Request(capability.url, {
-          method: 'GET', headers: capability.requiredHeaders, redirect: 'manual', signal,
-        }));
+        let response: Response;
+        if (recording.storageMode === 'parts') {
+          // The same stitched stream playback serves: parts open one after another on demand.
+          const parts = await repository.listParts(recording.id);
+          if (signal.aborted) throw new GeminiError('storage_read_failed');
+          response = await streamMultipartRecording(new Request('https://recording.invalid/', { signal }), runtime, recording, parts);
+        } else {
+          const capability = await runtime.storage.createSignedRead(recording.objectKey);
+          if (signal.aborted) throw new GeminiError('storage_read_failed');
+          response = await runtime.capabilityFetch(new Request(capability.url, {
+            method: 'GET', headers: capability.requiredHeaders, redirect: 'manual', signal,
+          }));
+        }
         const contentLength = response.headers.get('content-length');
         if (!response.ok || !response.body || (contentLength !== null && Number(contentLength) !== recording.sizeBytes)) {
           await response.body?.cancel();
@@ -247,6 +265,18 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
     }
   }
 
+  /** Whether advancing this job may stream its recording to Gemini (an inline submission or a Files upload). */
+  function mayStreamRecording(job: MarkdownJob): boolean {
+    return !TERMINAL.has(job.status) && job.status !== 'submitting' && !job.interactionId && !job.providerFileUri
+      && Date.parse(job.deadlineAt) > now().getTime();
+  }
+
+  /** The bytes advancing this job would stream; 0 when it will fail before reading the recording. */
+  async function streamedBytes(job: MarkdownJob): Promise<number> {
+    const recording = await repository.getRecording(job.recordingId).catch(() => null);
+    return recording && recording.uploadState === 'ready' && recording.sizeBytes <= MAX_MARKDOWN_BYTES ? recording.sizeBytes : 0;
+  }
+
   const service: MarkdownService & { advance: typeof advance; runPending: (limit?: number) => Promise<{ processed: number }> } = {
     async generate(recording, goal, requestId) {
       if (recording.sizeBytes > MAX_MARKDOWN_BYTES) {
@@ -269,7 +299,20 @@ export function createJobService(repository: Repository, runtime: StorageRuntime
     advance,
     async runPending(limit = 4) {
       const pending = await repository.listWork(Math.min(8, Math.max(1, limit)));
-      const results = await Promise.allSettled(pending.map((job) => advance(job.id)));
+      // Polling, cleanup and terminal rows are cheap and always run. Jobs that stream a
+      // recording start while the byte budget lasts; the rest are not claimed, so they
+      // stay due for the next cron run.
+      const selected: MarkdownJob[] = [];
+      let budgeted = 0;
+      for (const job of pending) {
+        if (mayStreamRecording(job)) {
+          const bytes = await streamedBytes(job);
+          if (budgeted > 0 && budgeted + bytes > MAX_STREAMED_BYTES_PER_RUN) continue;
+          budgeted += bytes;
+        }
+        selected.push(job);
+      }
+      const results = await Promise.allSettled(selected.map((job) => advance(job.id)));
       // One unavailable row must not starve unrelated recordings. The rejected job's
       // durable lease expires and the next cron invocation can recover it.
       return { processed: results.filter((result) => result.status === 'fulfilled').length };

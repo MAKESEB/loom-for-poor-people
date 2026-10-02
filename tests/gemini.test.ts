@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { createGeminiClient, GeminiError } from '../src/server/gemini';
+import { MAX_MARKDOWN_BYTES } from '../src/shared/policy';
 
 const API_KEY = 'test-gemini-key-must-stay-server-side';
 const GOOGLE_ORIGIN = 'https://generativelanguage.googleapis.com';
@@ -337,7 +338,7 @@ test('oversized declared uploads fail before reserving Google storage or opening
       return new Response(null, { status: 500 });
     }),
   });
-  await assert.rejects(client.uploadFile(uploadInput(50 * 1024 * 1024 + 1, async () => {
+  await assert.rejects(client.uploadFile(uploadInput(MAX_MARKDOWN_BYTES + 1, async () => {
     opened = true;
     return bytesStream(new Uint8Array(4));
   })), GeminiError);
@@ -411,8 +412,8 @@ function generatedResponse(prefix: string, repeatedCharacters: number, suffix: s
   return chunkedResponse(fragments(), state);
 }
 
-test('50 MiB inline video stays streamed with bounded lookahead and an exact base64 Content-Length', { timeout: 30_000 }, async () => {
-  const sizeBytes = 50 * 1024 * 1024;
+test('a 64 MiB inline video stays streamed with bounded lookahead and an exact base64 Content-Length below 100 MB', { timeout: 30_000 }, async () => {
+  const sizeBytes = MAX_MARKDOWN_BYTES;
   const block = Uint8Array.from({ length: 16_381 }, (_, index) => index % 251);
   const expectedHash = createHash('sha256');
   const receivedHash = createHash('sha256');
@@ -493,6 +494,7 @@ test('50 MiB inline video stays streamed with bounded lookahead and an exact bas
       assert.equal(receivedHash.digest('hex'), expectedHash.digest('hex'), 'base64 carry across uneven chunks must preserve every input byte');
       assert.equal(wireBytes, Buffer.byteLength(prefix) + 4 * Math.ceil(sizeBytes / 3) + Buffer.byteLength(suffix));
       assert.equal(request.headers.get('content-length'), String(wireBytes));
+      assert(wireBytes < 100_000_000, `Gemini accepts inline requests up to 100 MB (${wireBytes} bytes)`);
       const body = JSON.parse(prefix + suffix);
       assert.equal(body.background, true);
       assert.equal(body.store, true);
@@ -536,7 +538,7 @@ test('inline video rejects invalid lengths before opening storage and rejects mi
       return Response.json({ id: 'interaction-inline', status: 'in_progress', steps: [] });
     }),
   });
-  for (const sizeBytes of [0, -1, 1.5, 50 * 1024 * 1024 + 1]) {
+  for (const sizeBytes of [0, -1, 1.5, MAX_MARKDOWN_BYTES + 1]) {
     await assert.rejects(async () => client.createInteraction({
       ...input,
       inline: { sizeBytes, openBody: async () => { opened = true; return bytesStream(new Uint8Array(4)); } },
@@ -552,7 +554,7 @@ test('inline video rejects invalid lengths before opening storage and rejects mi
   }
 });
 
-test('GET discards a 50 MiB echoed inline video and preserves escaped Markdown across byte boundaries', { timeout: 30_000 }, async () => {
+test('GET discards the ~86 MiB echo of a 64 MiB inline video and preserves escaped Markdown across byte boundaries', { timeout: 30_000 }, async () => {
   const markdown = '# A "quoted" result\n\nWindows: C:\\recordings\\clip.webm\nUnicode: 🐓 Grüße\nLiteral: {"data":"keep this text"}';
   const prefix = '{"id":"interaction-inline","status":"completed","steps":[{"type":"user_input","content":[{"type":"video","mime_type":"video/webm","data":"';
   const suffix = '"},{"type":"text","text":"Ignore user input in the final output."}]},{"type":"thought","content":[{"type":"text","text":"private reasoning"}]},{"type":"model_output","content":[{"type":"text","text":' + JSON.stringify(markdown) + '}]}]}';
@@ -560,12 +562,12 @@ test('GET discards a 50 MiB echoed inline video and preserves escaped Markdown a
   const client = createGeminiClient({
     apiKey: API_KEY,
     requestTimeoutMs: 30_000,
-    fetch: fakeFetch(() => generatedResponse(prefix, 4 * Math.ceil(50 * 1024 * 1024 / 3), suffix, state)),
+    fetch: fakeFetch(() => generatedResponse(prefix, 4 * Math.ceil(MAX_MARKDOWN_BYTES / 3), suffix, state)),
   });
   assert.deepEqual(await client.getInteraction('interaction-inline'), {
     id: 'interaction-inline', status: 'completed', markdown,
   });
-  assert(state.emitted > 66 * 1024 * 1024, 'exercise the real maximum-size video echo rather than a small stand-in');
+  assert(state.emitted > 85 * 1024 * 1024, 'exercise the real maximum-size video echo rather than a small stand-in');
 });
 
 test('GET enforces both the wire-size limit and the smaller retained-JSON limit', { timeout: 30_000 }, async () => {

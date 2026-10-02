@@ -191,7 +191,7 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
 
       if (action === 'markdown' && request.method === 'POST' && !route[3]) {
         assertWrite(request, owner);
-        if (recording.sizeBytes > MAX_MARKDOWN_BYTES) throw new ApiError(413, 'markdown_too_large', 'Markdown is available for recordings up to 50 MiB.');
+        if (recording.sizeBytes > MAX_MARKDOWN_BYTES) throw new ApiError(413, 'markdown_too_large', `Markdown is available for recordings up to ${limitText(MAX_MARKDOWN_BYTES)}.`);
         const input = await readRequestJson(request);
         if (!isObject(input) || typeof input.goal !== 'string' || input.goal.length > 4000 || !isUuid(input.requestId)) {
           throw new ApiError(400, 'invalid_goal', 'Use a goal of 4,000 characters or fewer and a valid request ID.');

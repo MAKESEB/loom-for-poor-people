@@ -136,8 +136,22 @@ test('a recording uploads to R2, is indexed in D1 and streams back with ranges a
   assert.deepEqual(new Uint8Array(await viewer.arrayBuffer()), VIDEO);
 });
 
-test('recordings above the single-upload limit upload as 8 MiB R2 parts and seek across part boundaries', async t => {
-  const { app, req, signIn, bucket } = await setup(t);
+test('recordings above the single-upload limit upload as 8 MiB R2 parts, seek across part boundaries and feed Markdown', async t => {
+  let submitted: Uint8Array | null = null;
+  const client: GeminiClient = {
+    async uploadFile() { throw new Error('The inline path is used for new jobs.'); },
+    async getFile() { throw new Error('No Files-backed job exists.'); },
+    async deleteFile() { /* Nothing to clean up. */ },
+    async createInteraction(input) {
+      assert(input.inline);
+      submitted = new Uint8Array(await new Response(await input.inline.openBody(new AbortController().signal)).arrayBuffer());
+      return { id: 'interaction-parts', status: 'completed', markdown: '# Transcript' };
+    },
+    async getInteraction(id) { return { id, status: 'completed', markdown: '# Transcript' }; },
+    async cancelInteraction() { /* Already finished. */ },
+    async deleteInteraction() { /* Provider data is removed after the Markdown is stored. */ },
+  };
+  const { app, req, signIn, bucket } = await setup(t, { GEMINI_API_KEY: 'test-key' }, { markdown: { client } });
   await signIn();
   const size = MAX_SINGLE_UPLOAD_BYTES + 17;
   const bytes = new Uint8Array(size);
@@ -158,7 +172,7 @@ test('recordings above the single-upload limit upload as 8 MiB R2 parts and seek
   assert.equal(completed.status, 200, await completed.clone().text());
   const recording = await json<RecordingMetadata>(completed);
   assert.equal(recording.sizeBytes, size);
-  assert.equal(recording.markdownEligible, false);
+  assert.equal(recording.markdownEligible, true, 'Markdown covers parted recordings up to 64 MiB');
   const parts = [...bucket.objects.keys()].filter(key => key.startsWith(`recordings/${upload.id}/parts/`));
   assert.equal(parts.length, upload.partCount);
 
@@ -169,6 +183,17 @@ test('recordings above the single-upload limit upload as 8 MiB R2 parts and seek
   assert.deepEqual(new Uint8Array(await ranged.arrayBuffer()), bytes.slice(offset, offset + 53));
   const suffix = await app.fetch(req(recording.videoUrl, { headers: { range: 'bytes=-31' }, anonymous: true }));
   assert.deepEqual(new Uint8Array(await suffix.arrayBuffer()), bytes.slice(size - 31));
+
+  // Too large for the request's waitUntil window, so the cron streams the parts to Gemini in order.
+  await app.fetch(req(`/api/recordings/${upload.id}`, { method: 'PATCH', value: { markdownEnabled: true } }));
+  const started = await app.fetch(req(`/api/recordings/${upload.id}/markdown`, { value: { goal: '', requestId: crypto.randomUUID() } }), { waitUntil() { assert.fail('large videos wait for the cron'); } });
+  assert.equal(started.status, 202, await started.clone().text());
+  await app.scheduled();
+  assert(submitted, 'the job submitted the recording');
+  assert.equal((submitted as Uint8Array).length, size);
+  assert((submitted as Uint8Array).every((value, index) => value === bytes[index]), 'every part arrives, in order');
+  const view = await json<{ status: string; markdown: string }>(app.fetch(req(`/api/recordings/${upload.id}/markdown`)));
+  assert.deepEqual([view.status, view.markdown], ['completed', '# Transcript']);
 });
 
 test('Cloudflare accepts recordings up to 10 GiB, stored as up to 1,280 parts', async t => {

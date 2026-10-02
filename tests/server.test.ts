@@ -455,7 +455,7 @@ function expectedPattern(length: number, start: number) {
   return Uint8Array.from({ length }, (_, index) => (start + index) % 251);
 }
 
-test('configuration separates 1 GiB Postgres recordings and 50 MiB Markdown with no independent duration cap', async t => {
+test('configuration separates 1 GiB Postgres recordings and 64 MiB Markdown with no independent duration cap', async t => {
   const { handle, req, repository, transfers } = await setup(t);
   const config = await (await handle(req('/api/config'))).json();
   assert.equal(config.maxBytes, 1024 * 1024 * 1024);
@@ -463,6 +463,7 @@ test('configuration separates 1 GiB Postgres recordings and 50 MiB Markdown with
   assert.equal(config.maxDurationSeconds, null);
   assert.equal(MAX_DURATION_SECONDS, null);
   assert.equal(config.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
+  assert.equal(MAX_MARKDOWN_BYTES, 64 * 1024 * 1024);
   const large = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: POSTGRES_MAX_RECORDING_BYTES, durationSeconds: 24 * 60 * 60 } }));
   assert.equal(large.status, 201, await large.clone().text());
   const reservation = await large.json();
@@ -515,7 +516,7 @@ test('explicit public viewing ignores a creator cookie, and manage viewing alway
   assert.equal((await (await handle(req(`${base}?view=manage`))).json()).isOwner, true);
 });
 
-test('large bounded part uploads are immutable, publish atomically, seek across boundaries and reject AI', async t => {
+test('large bounded part uploads are immutable, publish atomically, seek across boundaries, feed Markdown and delete completely', async t => {
   let generated = 0;
   const markdown: MarkdownService = {
     async generate(recording) { generated++; return { enabled: recording.markdownEnabled, status: 'queued', markdown: null }; },
@@ -559,7 +560,7 @@ test('large bounded part uploads are immutable, publish atomically, seek across 
   const recording = completed[0];
   assert.equal(recording.sizeBytes, size);
   assert.equal(recording.durationSeconds, 7200);
-  assert.equal(recording.markdownEligible, false);
+  assert.equal(recording.markdownEligible, true, 'Markdown covers parted recordings');
   assert.equal(recording.maxMarkdownBytes, MAX_MARKDOWN_BYTES);
   const signedReads = state.signedReadCalls;
   const head = await handle(req(`${recording.videoUrl}?view=public`, { method: 'HEAD', anonymous: true }));
@@ -574,8 +575,8 @@ test('large bounded part uploads are immutable, publish atomically, seek across 
   const outside = await handle(req(recording.videoUrl, { headers: { range: `bytes=${size}-` }, anonymous: true }));
   assert.equal(outside.status, 416); assert.equal(outside.headers.get('content-range'), `bytes */${size}`);
   await handle(req(`/api/recordings/${upload.id}`, { method: 'PATCH', value: { markdownEnabled: true, protected: true } }));
-  const deniedAi = await handle(req(`/api/recordings/${upload.id}/markdown`, { value: { goal: '', requestId: crypto.randomUUID() } }));
-  assert.equal(deniedAi.status, 413); assert.equal((await deniedAi.json()).code, 'markdown_too_large'); assert.equal(generated, 0);
+  const acceptedAi = await handle(req(`/api/recordings/${upload.id}/markdown`, { value: { goal: '', requestId: crypto.randomUUID() } }));
+  assert.equal(acceptedAi.status, 202, await acceptedAi.clone().text()); assert.equal(generated, 1);
   assert.equal((await handle(req(`${recording.videoUrl}?view=public`))).status, 403, 'part playback inherits creator-cookie-independent public authorization');
   assert.equal((await put(6, lastLength)).status, 204, 'identical part replay remains safe after the manifest is sealed');
 
@@ -588,6 +589,24 @@ test('large bounded part uploads are immutable, publish atomically, seek across 
   assert.equal((await repository.getRecording(upload.id))?.uploadState, 'deleted');
   assert.equal((await handle(req(recording.videoUrl, { headers: { range: 'bytes=0-9' } }))).status, 404);
   assert.equal((await put(6, lastLength)).status, 404, 'a deleted upload accepts no parts');
+});
+
+test('Markdown above 64 MiB is refused before any job starts', async t => {
+  let generated = 0;
+  const markdown: MarkdownService = {
+    async generate(recording) { generated++; return { enabled: recording.markdownEnabled, status: 'queued', markdown: null }; },
+    async status(recording) { return { enabled: recording.markdownEnabled, status: 'idle', markdown: null }; },
+  };
+  const { handle, req, prepare, complete, database } = await setup(t, markdown);
+  const upload = await prepare();
+  await complete(upload);
+  await database.query('UPDATE slop_recordings SET full_size_bytes = $2 WHERE id = $1', [upload.id, MAX_MARKDOWN_BYTES + 1]);
+  const metadata = await (await handle(req(`/api/recordings/${upload.id}`, { method: 'PATCH', value: { markdownEnabled: true } }))).json();
+  assert.equal(metadata.markdownEligible, false);
+  const refused = await handle(req(`/api/recordings/${upload.id}/markdown`, { value: { goal: '', requestId: crypto.randomUUID() } }));
+  assert.equal(refused.status, 413);
+  assert.deepEqual(await refused.json(), { error: 'Markdown is available for recordings up to 64 MiB.', code: 'markdown_too_large' });
+  assert.equal(generated, 0);
 });
 
 test('any signed-in creator deletes a recording; afterwards every route treats it as missing', async t => {

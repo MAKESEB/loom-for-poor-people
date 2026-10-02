@@ -125,7 +125,7 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 /** Google echoes inline media in user_input. Project oversized string values to
- * empty strings while streaming, so a 67 MiB echo never becomes a JS string.
+ * empty strings while streaming, so an ~86 MiB echo never becomes a JS string.
  * Markdown output is capped at 16K tokens and safely fits the retained limit. */
 async function readInteractionJson(response: Response): Promise<unknown> {
   const reader = response.body?.getReader();
@@ -295,7 +295,8 @@ export function createGeminiClient(config: GeminiClientConfig) {
   if (!config.apiKey?.trim()) throw new GeminiError('provider_unconfigured');
   const providerFetch = config.fetch ?? fetch;
   const requestTimeout = config.requestTimeoutMs ?? 15_000;
-  const uploadTimeout = config.uploadTimeoutMs ?? 90_000;
+  // A maximum-size video is ~86 MiB of base64 up, and Google echoes it back down. Stays below the 240-second job lease.
+  const uploadTimeout = config.uploadTimeoutMs ?? 180_000;
   const headers = (extra?: HeadersInit) => {
     const result = new Headers(extra);
     result.set('x-goog-api-key', config.apiKey);
