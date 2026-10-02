@@ -177,6 +177,46 @@ describe('repository against the real Postgres migration', () => {
     assert.equal((await local.repository.createPart(largest.id, 127))?.sizeBytes, UPLOAD_CHUNK_BYTES);
   });
 
+  test('deleting tombstones a ready recording, clears its content and lets its parts go', async () => {
+    const record = await multipartRecording();
+    for (let index = 0; index < record.partCount!; index++) await finishPart(record.id, index);
+    assert.equal(await local.repository.deleteRecording(record.id), null, 'a pending upload is not deletable');
+    assert.equal(await local.repository.deleteRecording(randomUUID()), null);
+    const ready = (await local.repository.completeMultipartRecording(record.id))!;
+    assert.equal(ready.uploadState, 'ready');
+    await local.repository.updateRecording(record.id, { protected: true, markdownEnabled: true });
+    await local.repository.deletePart(record.id, 0);
+    assert.equal((await local.repository.listParts(record.id)).length, record.partCount, 'parts of a live recording stay');
+
+    const finished = (await local.repository.createJob({ id: randomUUID(), requestId: randomUUID(), recordingId: record.id, goal: 'A private goal.' })).job;
+    await local.database.query("UPDATE slop_markdown_jobs SET status = 'completed', markdown = '# Private result' WHERE id = $1", [finished.id]);
+    const active = (await local.repository.createJob({ id: randomUUID(), requestId: randomUUID(), recordingId: record.id, goal: 'Still running.' })).job;
+
+    const deleted = await local.repository.deleteRecording(record.id);
+    assert.equal(deleted?.uploadState, 'deleted');
+    assert.equal(deleted?.title, 'Deleted recording');
+    assert.equal(deleted?.protected, false);
+    assert.equal(deleted?.markdownEnabled, false);
+    assert.deepEqual(await local.repository.deleteRecording(record.id), deleted, 'deleting again returns the tombstone');
+    assert.deepEqual(await local.repository.getRecording(record.id), deleted);
+    const cleared = await local.repository.getJob(finished.id);
+    assert.equal(cleared?.markdown, null);
+    assert.equal(cleared?.goal, '');
+    assert.equal((await local.repository.getJob(active.id))?.goal, 'Still running.', 'an active job keeps its lease-fenced row');
+
+    await local.repository.deletePart(record.id, 0);
+    assert.deepEqual((await local.repository.listParts(record.id)).map(part => part.index), Array.from({ length: record.partCount! - 1 }, (_, index) => index + 1));
+    assert.equal(await local.repository.createPart(record.id, 0), null, 'a deleted recording takes no new parts');
+    assert.equal(await local.repository.completeMultipartRecording(record.id), null, 'a deleted recording is never published again');
+
+    const single = await local.repository.createRecording(recordingInput());
+    await local.repository.attachTransfer(single.id, 'transfer-single');
+    await local.repository.completeRecording(single.id);
+    assert.equal((await local.repository.deleteRecording(single.id))?.uploadState, 'deleted');
+    await assert.rejects(local.repository.completeRecording(single.id), /unavailable/, 'completion cannot revive a deleted recording');
+    assert.equal((await local.repository.getRecordingByRequest(single.requestId))?.uploadState, 'deleted', 'a replayed upload request sees the tombstone');
+  });
+
   test('part leases fence every data mutation across expired owners and same-owner reclaims', async () => {
     const record = await multipartRecording();
     assert(await local.repository.createPart(record.id, 0));
@@ -411,6 +451,10 @@ test('the additive upload migration preserves an existing legacy recording and s
     assert.deepEqual((await database.query('SELECT * FROM slop_recordings WHERE id = $1', [record.id])).rows[0], expectedChunked);
     await database.exec(chunked);
     assert.deepEqual((await database.query('SELECT * FROM slop_recordings WHERE id = $1', [record.id])).rows[0], expectedChunked, 'chunk migration is additive and replay-safe');
+    const deletion = await readFile(new URL('../migrations/20261002090000_deleted_recordings.sql', import.meta.url), 'utf8');
+    await database.exec(deletion);
+    await database.exec(deletion);
+    assert.deepEqual((await database.query('SELECT * FROM slop_recordings WHERE id = $1', [record.id])).rows[0], { ...expectedChunked, deleted_at: null }, 'the deletion marker is additive and replay-safe');
     const client: QueryClient = {
       async query({ text, values }) {
         const result = await database.query<Record<string, unknown>>(text, [...values]);

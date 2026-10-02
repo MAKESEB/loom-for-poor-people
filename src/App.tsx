@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, Download, FileText, Link2, LoaderCircle, LockKeyhole, LogOut, Mic, MicOff, Monitor, Pause, Play, Plus, RefreshCw, ShieldCheck, Square, Volume2, VolumeX, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, Download, FileText, Link2, LoaderCircle, LockKeyhole, LogOut, Mic, MicOff, Monitor, Pause, Play, Plus, RefreshCw, ShieldCheck, Square, Trash2, Volume2, VolumeX, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, ApiError, recordingApiPath, uploadBlob, type MarkdownResult, type Recording, type RecordingView, type Upload } from './client/api';
+import { api, ApiError, deleteRecording, recordingApiPath, uploadBlob, type MarkdownResult, type Recording, type RecordingView, type Upload } from './client/api';
 import { useScreenRecorder } from './client/useScreenRecorder';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
@@ -12,6 +12,7 @@ import { MAX_DURATION_SECONDS, MAX_MARKDOWN_BYTES, MAX_RECORDING_BYTES, MIB } fr
 
 const ACTIVE_JOBS = new Set<MarkdownResult['status']>(['queued', 'uploading', 'processing', 'submitting', 'generating']);
 interface RecorderConfig { maxBytes: number; maxDurationSeconds: number | null; maxMarkdownBytes: number; configured: boolean }
+const HOME_TITLE = document.title;
 const INITIAL_CONFIG: RecorderConfig = { maxBytes: MAX_RECORDING_BYTES, maxDurationSeconds: MAX_DURATION_SECONDS, maxMarkdownBytes: MAX_MARKDOWN_BYTES, configured: false };
 
 function messageOf(error: unknown, fallback = 'Something went wrong. Please try again.') {
@@ -141,7 +142,36 @@ function MarkdownDocument({ markdown, downloadUrl }: { markdown: string; downloa
   </section>;
 }
 
-function RecordingDetails({ recording, onChange, view, token = '' }: { recording: Recording; onChange: (recording: Recording) => void; view: RecordingView; token?: string }) {
+function DeleteRecording({ recording, onDeleted }: { recording: Recording; onDeleted: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState('');
+
+  async function remove() {
+    setDeleting(true);
+    setError('');
+    try {
+      await deleteRecording(recording.id);
+      onDeleted();
+    } catch (reason) {
+      // Already gone, for example deleted in another tab.
+      if (reason instanceof ApiError && reason.status === 404) { onDeleted(); return; }
+      setError(messageOf(reason, 'The video couldn’t be deleted. Please try again.'));
+      setDeleting(false);
+    }
+  }
+
+  return <div className="delete-row">
+    {confirming ? <div className="delete-confirm" role="group" aria-label="Delete this recording">
+      <span>Delete? Its link stops working.</span>
+      <Button size="sm" className="delete-confirm-button" disabled={deleting} onClick={() => void remove()}>{deleting ? <Spinner label="Deleting…" /> : <><Trash2 aria-hidden="true" />Delete</>}</Button>
+      <Button size="sm" variant="ghost" disabled={deleting} onClick={() => { setConfirming(false); setError(''); }}>Cancel</Button>
+    </div> : <Button size="sm" variant="ghost" className="delete-recording" onClick={() => setConfirming(true)}><Trash2 aria-hidden="true" />Delete recording</Button>}
+    {error && <Notice error>{error}</Notice>}
+  </div>;
+}
+
+function RecordingDetails({ recording, onChange, onDeleted, view, token = '' }: { recording: Recording; onChange: (recording: Recording) => void; onDeleted: () => void; view: RecordingView; token?: string }) {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [goal, setGoal] = useState('');
@@ -244,6 +274,7 @@ function RecordingDetails({ recording, onChange, view, token = '' }: { recording
         {generationError && <Notice error>{generationError}</Notice>}
         {pollError && <p className="helper-text" role="status">Reconnecting to check your Markdown…</p>}
       </div>}
+      <DeleteRecording recording={recording} onDeleted={onDeleted} />
     </section>}
     {showDocument && <MarkdownDocument markdown={markdown!.markdown!} downloadUrl={recordingApiPath(recording.id, 'markdown/download', token, view)} />}
   </>;
@@ -404,6 +435,13 @@ function Viewer({ id, view, token = '', sessionRevision, onLogout }: { id: strin
     return () => { cancelled = true; };
   }, [id, token, view, sessionRevision, attempt]);
 
+  // After a deletion, go back to the recorder; Back must not return to the deleted recording.
+  function returnToRecorder() {
+    window.history.replaceState(null, '', '/');
+    document.title = HOME_TITLE;
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  }
+
   return <>
     <Header>{view === 'manage' && <><Button asChild variant="outline" size="sm"><a href="/"><Plus />New recording</a></Button><Button variant="ghost" size="icon" aria-label="Sign out" onClick={() => void onLogout().catch((reason) => setError(messageOf(reason)))}><LogOut /></Button></>}</Header>
     <main className="viewer-main page-width">
@@ -412,7 +450,7 @@ function Viewer({ id, view, token = '', sessionRevision, onLogout }: { id: strin
         <section className="recorder-card" aria-label="Shared recording"><div className="video-stage video-stage-filled"><video key={`${recording.videoUrl}:${attempt}`} src={recording.videoUrl} controls playsInline preload="metadata" aria-label="Shared video" onError={() => setMediaError(true)} onLoadedData={() => setMediaError(false)} /></div><div className="recorder-toolbar"><span className="recording-meta">{recording.protected ? <LockKeyhole size={13} /> : <Check size={13} />}{recording.protected ? 'Protected link' : 'Ready to watch'}<span>·</span>{fileSize(recording.sizeBytes)}</span><Button asChild variant="ghost" size="sm"><a href={recording.videoUrl} download={`slop-rooster.${recording.contentType === 'video/mp4' ? 'mp4' : 'webm'}`}><Download /><span>Download video</span></a></Button></div></section>
         {mediaError && <Notice error>This video couldn’t load. <button className="inline-link" onClick={() => { setMediaError(false); setAttempt((value) => value + 1); }}>Try again</button></Notice>}
         {error && <Notice error>{error}</Notice>}
-        <RecordingDetails key={`${view}:${id}`} recording={recording} onChange={setRecording} view={view} token={token} />
+        <RecordingDetails key={`${view}:${id}`} recording={recording} onChange={setRecording} onDeleted={returnToRecorder} view={view} token={token} />
       </>}
     </main>
     <Footer />

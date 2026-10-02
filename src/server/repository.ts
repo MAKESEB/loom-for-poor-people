@@ -81,10 +81,20 @@ export function createRepository(client: QueryClient): Repository {
       await rows('UPDATE slop_recordings SET upload_lease_owner = NULL, upload_lease_until = NULL WHERE id = $1 AND upload_lease_owner = $2', [id, owner]);
     },
     async completeRecording(id) {
-      return required(await recording("UPDATE slop_recordings SET upload_state = 'ready' WHERE id = $1 AND storage_mode = 'single' AND transfer_id IS NOT NULL RETURNING *", [id]));
+      return required(await recording("UPDATE slop_recordings SET upload_state = 'ready' WHERE id = $1 AND storage_mode = 'single' AND transfer_id IS NOT NULL AND deleted_at IS NULL RETURNING *", [id]));
     },
     async updateRecording(id, patch) {
       return required(await recording('UPDATE slop_recordings SET protected = COALESCE($2::boolean, protected), markdown_enabled = COALESCE($3::boolean, markdown_enabled) WHERE id = $1 RETURNING *', [id, patch.protected ?? null, patch.markdownEnabled ?? null]));
+    },
+    async deleteRecording(id) {
+      // A deleted recording keeps upload_state 'ready' (its CHECK constraint is fixed); deleted_at marks it.
+      const deleted = await recording(`UPDATE slop_recordings SET deleted_at = COALESCE(deleted_at, now()), title = 'Deleted recording',
+          protected = false, markdown_enabled = false
+        WHERE id = $1 AND upload_state = 'ready' RETURNING *`, [id]);
+      // Finished jobs only: an active job keeps its lease-fenced row and fails on its next run.
+      if (deleted) await rows(`UPDATE slop_markdown_jobs SET markdown = NULL, goal = '', updated_at = now()
+        WHERE recording_id = $1 AND status NOT IN ${activeSql}`, [deleted.id]);
+      return deleted;
     },
     async createPart(recordingId, index) {
       if (!Number.isInteger(index) || index < 0 || index >= POSTGRES_MAX_PART_COUNT) return null;
@@ -100,6 +110,10 @@ export function createRepository(client: QueryClient): Repository {
     getPart: (id, index) => part('SELECT * FROM slop_recording_parts WHERE recording_id = $1 AND part_index = $2', [id, index]),
     async listParts(id) {
       return (await rows('SELECT * FROM slop_recording_parts WHERE recording_id = $1 ORDER BY part_index', [id])).map(mapPart);
+    },
+    async deletePart(id, index) {
+      await rows(`DELETE FROM slop_recording_parts WHERE recording_id = $1 AND part_index = $2
+        AND EXISTS (SELECT 1 FROM slop_recordings r WHERE r.id = $1 AND r.deleted_at IS NOT NULL)`, [id, index]);
     },
     claimPart: (id, index, owner) => part(`${writableRecordingSql}
       UPDATE slop_recording_parts p SET lease_owner = $3, lease_until = now() + interval '3 minutes',
@@ -132,7 +146,7 @@ export function createRepository(client: QueryClient): Repository {
             OR p.size_bytes <> LEAST(r.chunk_size_bytes, r.full_size_bytes - p.part_index * r.chunk_size_bytes)
             OR p.object_key <> 'recordings/' || r.id::text || '/parts/' || lpad(p.part_index::text, 6, '0')
           )) RETURNING r.*`, [id]);
-      return completed ?? recording("SELECT * FROM slop_recordings WHERE id = $1 AND storage_mode = 'parts' AND upload_state = 'ready'", [id]);
+      return completed ?? recording("SELECT * FROM slop_recordings WHERE id = $1 AND storage_mode = 'parts' AND upload_state = 'ready' AND deleted_at IS NULL", [id]);
     },
     async createJob(input) {
       const created = await job(`INSERT INTO slop_markdown_jobs (id, recording_id, request_id, goal)
@@ -181,7 +195,7 @@ function mapRecording(row: Readonly<Record<string, unknown>>): RecordingRow {
   return { id: String(row.id), requestId: String(row.request_id), uploadId: String(row.upload_id), title: String(row.title),
     contentType: String(row.content_type), sizeBytes: Number(row.full_size_bytes ?? row.size_bytes), durationSeconds: Number(row.full_duration_seconds ?? row.duration_seconds),
     createdAt: iso(row.created_at), objectKey: String(row.object_key), transferId: nullable(row.transfer_id), uploadSha256: nullable(row.upload_sha256), uploadAttempted: row.upload_attempted_at != null,
-    uploadState: row.upload_state as RecordingRow['uploadState'], protected: row.protected === true, markdownEnabled: row.markdown_enabled === true,
+    uploadState: row.deleted_at != null ? 'deleted' : row.upload_state as RecordingRow['uploadState'], protected: row.protected === true, markdownEnabled: row.markdown_enabled === true,
     storageMode: row.storage_mode === 'parts' ? 'parts' : 'single',
     ...(row.chunk_size_bytes == null ? {} : { chunkSizeBytes: Number(row.chunk_size_bytes) }),
     ...(row.part_count == null ? {} : { partCount: Number(row.part_count) }) };

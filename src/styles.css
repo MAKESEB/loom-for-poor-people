@@ -150,6 +150,15 @@
 .generation-action > [data-slot='button'] > svg { width: 13px; height: 13px; }
 .mobile-break { display: none; }
 .job-note { font-size: 11px; color: #71717a; line-height: 1.7; margin-top: 15px; }
+.delete-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.delete-row [data-slot='button'] { height: 32px; gap: 5px; padding-inline: 10px; font-size: 11px; }
+.delete-row [data-slot='button'] > svg { width: 13px; height: 13px; }
+.delete-row > button.delete-recording { color: #71717a; }
+.delete-confirm { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.delete-confirm > span { margin-right: 4px; color: #52525b; font-size: 11px; }
+.delete-confirm > button.delete-confirm-button { color: #fff; background: var(--destructive); }
+.delete-confirm > button.delete-confirm-button:hover { background: #b91c1c; }
+.delete-row > .notice { flex-basis: 100%; margin-top: 0; }
 .viewer-generating { padding: 32px 0; display: flex; flex-direction: column; align-items: center; gap: 10px; border-bottom: 1px solid #eee; margin-top: 12px; }
 .viewer-generating > .loading-inline { color: #71717a; font-size: 12px; }
 .viewer-generating > span:last-child { color: #a1a1aa; font-size: 11px; }

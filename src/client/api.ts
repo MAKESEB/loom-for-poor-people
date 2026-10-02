@@ -63,6 +63,11 @@ export async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+/** Deletes a recording, its stored video and its saved Markdown. Its links stop working. */
+export function deleteRecording(id: string): Promise<void> {
+  return api<void>(recordingApiPath(id, '', '', 'manage'), { method: 'DELETE' });
+}
+
 export function recordingApiPath(id: string, action = '', token = '', view?: RecordingView) {
   const query = new URLSearchParams();
   if (token) query.set('token', token);

@@ -521,7 +521,7 @@ test('large bounded part uploads are immutable, publish atomically, seek across 
     async generate(recording) { generated++; return { enabled: recording.markdownEnabled, status: 'queued', markdown: null }; },
     async status(recording) { return { enabled: recording.markdownEnabled, status: 'idle', markdown: null }; },
   };
-  const { handle, req, complete, repository, transfers, state } = await setup(t, markdown);
+  const { handle, req, complete, repository, transfers, state, objects } = await setup(t, markdown);
   const size = MAX_SINGLE_UPLOAD_BYTES + 17;
   const reservationResponse = await handle(req('/api/recordings/uploads', { value: { ...DETAILS, sizeBytes: size, durationSeconds: 7200 } }));
   assert.equal(reservationResponse.status, 201, await reservationResponse.clone().text());
@@ -578,6 +578,55 @@ test('large bounded part uploads are immutable, publish atomically, seek across 
   assert.equal(deniedAi.status, 413); assert.equal((await deniedAi.json()).code, 'markdown_too_large'); assert.equal(generated, 0);
   assert.equal((await handle(req(`${recording.videoUrl}?view=public`))).status, 403, 'part playback inherits creator-cookie-independent public authorization');
   assert.equal((await put(6, lastLength)).status, 204, 'identical part replay remains safe after the manifest is sealed');
+
+  const partKeys = rows.map(row => row.objectKey);
+  assert(partKeys.every(key => objects.has(key)));
+  const deleted = await handle(req(`/api/recordings/${upload.id}`, { method: 'DELETE', headers: { origin: ORIGIN } }));
+  assert.equal(deleted.status, 204, await deleted.clone().text());
+  assert(partKeys.every(key => !objects.has(key)), 'every stored part is removed');
+  assert.deepEqual(await repository.listParts(upload.id), []);
+  assert.equal((await repository.getRecording(upload.id))?.uploadState, 'deleted');
+  assert.equal((await handle(req(recording.videoUrl, { headers: { range: 'bytes=0-9' } }))).status, 404);
+  assert.equal((await put(6, lastLength)).status, 404, 'a deleted upload accepts no parts');
+});
+
+test('any signed-in creator deletes a recording; afterwards every route treats it as missing', async t => {
+  const { handle, req, prepare, complete, objects, repository } = await setup(t);
+  const upload = await prepare();
+  await complete(upload);
+  const objectKey = `recordings/${upload.id}/video`;
+  const remove = (headers: Record<string, string> = { origin: ORIGIN }, options: { anonymous?: boolean; query?: string } = {}) =>
+    handle(req(`/api/recordings/${upload.id}${options.query ?? ''}`, { method: 'DELETE', headers, anonymous: options.anonymous }));
+
+  assert.equal((await remove({ origin: ORIGIN }, { anonymous: true })).status, 401, 'deleting needs a creator session');
+  const readOnly = await remove({ origin: ORIGIN }, { query: '?view=public' });
+  assert.equal(readOnly.status, 403, 'the sharing view stays read-only, even in a creator browser');
+  assert.equal((await readOnly.json()).code, 'read_only_view');
+  assert.equal((await remove({ origin: 'https://malicious.test' })).status, 403, 'cross-site deletion is refused');
+  assert.equal((await remove({ 'sec-fetch-site': 'cross-site' })).status, 403, 'a browser-flagged cross-site request is refused');
+  assert(objects.has(objectKey));
+  assert.equal((await repository.getRecording(upload.id))?.uploadState, 'ready');
+
+  const response = await remove();
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert(!objects.has(objectKey), 'the stored video is removed');
+  const row = await repository.getRecording(upload.id);
+  assert.equal(row?.uploadState, 'deleted');
+  assert.equal(row?.title, 'Deleted recording');
+
+  for (const path of [`/api/recordings/${upload.id}`, `/api/recordings/${upload.id}?view=public`, `/api/recordings/${upload.id}?view=manage`, `/api/recordings/${upload.id}/video`, `/api/recordings/${upload.id}/markdown`]) {
+    assert.equal((await handle(req(path))).status, 404, path);
+    if (!path.includes('view=manage')) assert.equal((await handle(req(path, { anonymous: true }))).status, 404, path);
+  }
+  assert.equal((await handle(req(`/api/recordings/${upload.id}`, { method: 'PATCH', value: { protected: true } }))).status, 404);
+  assert.equal((await handle(req(`/api/recordings/${upload.id}/complete`, { value: { uploadId: upload.uploadId } }))).status, 404, 'a deleted upload cannot be completed again');
+  assert.equal((await handle(req(`/api/recordings/${upload.id}/upload?uploadId=${upload.uploadId}`, { method: 'PUT', body: VIDEO.slice().buffer, headers: { 'content-type': 'video/webm' } }))).status, 404);
+  const replay = await handle(req('/api/recordings/uploads', { value: DETAILS }));
+  assert.equal(replay.status, 409, 'replaying the original upload request cannot revive it');
+  assert.equal((await replay.json()).code, 'recording_deleted');
+  assert.equal((await remove()).status, 204, 'deleting again is safe and finishes an interrupted deletion');
+  assert.equal((await handle(req(`/api/recordings/${OTHER_ID}`, { method: 'DELETE', headers: { origin: ORIGIN } }))).status, 404);
 });
 
 test('concurrent writes to one upload part admit one writer and preserve the first body', async t => {

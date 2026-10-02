@@ -11,7 +11,7 @@ export interface RecordingRow {
   transferId: string | null;
   uploadSha256: string | null;
   uploadAttempted: boolean;
-  uploadState: 'pending' | 'ready';
+  uploadState: 'pending' | 'ready' | 'deleted';
   protected: boolean;
   markdownEnabled: boolean;
   storageMode?: 'single' | 'parts';
@@ -69,9 +69,17 @@ export interface Repository {
   releaseUpload(id: string, owner: string): Promise<void>;
   completeRecording(id: string): Promise<RecordingRow>;
   updateRecording(id: string, patch: { protected?: boolean; markdownEnabled?: boolean }): Promise<RecordingRow>;
+  /**
+   * Marks a ready recording deleted, clears its title, sharing settings and the saved Markdown of
+   * its finished jobs, and returns it; an already deleted one is returned again. Null for a pending
+   * or missing recording. The row stays as a tombstone for the jobs that reference it.
+   */
+  deleteRecording(id: string): Promise<RecordingRow | null>;
   createPart(recordingId: string, index: number): Promise<RecordingPart | null>;
   getPart(recordingId: string, index: number): Promise<RecordingPart | null>;
   listParts(recordingId: string): Promise<RecordingPart[]>;
+  /** Forgets a deleted recording's part once its stored object is gone. */
+  deletePart(recordingId: string, index: number): Promise<void>;
   claimPart(recordingId: string, index: number, owner: string): Promise<RecordingPart | null>;
   attachPartTransfer(recordingId: string, index: number, owner: string, fence: number, transferId: string): Promise<RecordingPart | null>;
   savePartDigest(recordingId: string, index: number, owner: string, fence: number, digest: string): Promise<RecordingPart | null>;

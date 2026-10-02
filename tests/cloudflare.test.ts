@@ -192,6 +192,50 @@ test('Cloudflare accepts recordings up to 10 GiB, stored as up to 1,280 parts', 
   assert.equal((await app.fetch(req(`${upload.uploadUrl}&part=${MAX_PART_COUNT}`, { method: 'PUT', body: bytes.buffer, headers: upload.headers }))).status, 400);
 });
 
+test('deleting removes the R2 objects and tombstones the D1 row; an interrupted deletion resumes', async t => {
+  const { app, req, signIn, record, bucket, repository } = await setup(t);
+  await signIn();
+  const { upload } = await record();
+  const deleted = await app.fetch(req(`/api/recordings/${upload.id}?view=manage`, { method: 'DELETE', headers: { origin: ORIGIN } }));
+  assert.equal(deleted.status, 204, await deleted.clone().text());
+  assert(!bucket.objects.has(`recordings/${upload.id}/video`));
+  assert.equal((await repository.getRecording(upload.id))?.uploadState, 'deleted');
+  assert.equal((await app.fetch(req(`/api/recordings/${upload.id}`))).status, 404);
+  assert.equal((await app.fetch(req(`/api/recordings/${upload.id}/video?view=public`, { anonymous: true }))).status, 404);
+
+  const size = MAX_SINGLE_UPLOAD_BYTES + 17;
+  const bytes = new Uint8Array(size).fill(3);
+  const reservation = await json<UploadBody>(app.fetch(req('/api/recordings/uploads', {
+    value: { id: crypto.randomUUID(), title: 'Parted walkthrough', contentType: 'video/webm', sizeBytes: size, durationSeconds: 60 },
+  })));
+  for (let part = 0; part < reservation.partCount!; part++) {
+    const slice = bytes.slice(part * UPLOAD_CHUNK_BYTES, Math.min(size, (part + 1) * UPLOAD_CHUNK_BYTES));
+    assert.equal((await app.fetch(req(`${reservation.uploadUrl}&part=${part}`, { method: 'PUT', body: slice.buffer, headers: reservation.headers }))).status, 204);
+  }
+  assert.equal((await app.fetch(req(`/api/recordings/${reservation.id}/complete`, { value: { uploadId: reservation.uploadId } }))).status, 200);
+  const partKey = (index: number) => `recordings/${reservation.id}/parts/${String(index).padStart(6, '0')}`;
+  assert.equal([...bucket.objects.keys()].filter(key => key.startsWith(`recordings/${reservation.id}/parts/`)).length, reservation.partCount);
+
+  // R2 fails once for part 3: the request fails, and the parts already removed are forgotten.
+  const remove = bucket.delete.bind(bucket);
+  let failed = false;
+  bucket.delete = async keys => {
+    if (!failed && keys === partKey(3)) { failed = true; throw new Error('R2 is unavailable'); }
+    return remove(keys);
+  };
+  const interrupted = await app.fetch(req(`/api/recordings/${reservation.id}`, { method: 'DELETE', headers: { origin: ORIGIN } }));
+  assert.equal(interrupted.status, 502);
+  assert.equal((await repository.getRecording(reservation.id))?.uploadState, 'deleted', 'the recording is gone for viewers right away');
+  assert(bucket.objects.has(partKey(3)));
+  assert((await repository.listParts(reservation.id)).some(part => part.index === 3));
+  assert(!(await repository.listParts(reservation.id)).some(part => part.index === 0), 'a removed part is forgotten');
+
+  const resumed = await app.fetch(req(`/api/recordings/${reservation.id}`, { method: 'DELETE', headers: { origin: ORIGIN } }));
+  assert.equal(resumed.status, 204, await resumed.clone().text());
+  assert.deepEqual([...bucket.objects.keys()].filter(key => key.startsWith('recordings/')), [], 'no video bytes remain in R2');
+  assert.deepEqual(await repository.listParts(reservation.id), []);
+});
+
 test('Markdown jobs read the video from R2; the scheduled run completes queued work before it resolves', async t => {
   const submitted: { goal: string; bytes: Uint8Array }[] = [];
   const client: GeminiClient = {

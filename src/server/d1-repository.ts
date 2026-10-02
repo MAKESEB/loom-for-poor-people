@@ -80,11 +80,20 @@ export function createD1Repository(db: D1DatabaseLike): Repository {
       await execute('UPDATE slop_recordings SET upload_lease_owner = NULL, upload_lease_until = NULL WHERE id = ?1 AND upload_lease_owner = ?2', [uuid(id), owner]);
     },
     async completeRecording(id) {
-      return required(await recording("UPDATE slop_recordings SET upload_state = 'ready' WHERE id = ?1 AND storage_mode = 'single' AND transfer_id IS NOT NULL RETURNING *", [uuid(id)]));
+      return required(await recording("UPDATE slop_recordings SET upload_state = 'ready' WHERE id = ?1 AND storage_mode = 'single' AND transfer_id IS NOT NULL AND upload_state <> 'deleted' RETURNING *", [uuid(id)]));
     },
     async updateRecording(id, patch) {
       return required(await recording('UPDATE slop_recordings SET protected = COALESCE(?2, protected), markdown_enabled = COALESCE(?3, markdown_enabled) WHERE id = ?1 RETURNING *',
         [uuid(id), flag(patch.protected), flag(patch.markdownEnabled)]));
+    },
+    async deleteRecording(id) {
+      const deleted = await recording(`UPDATE slop_recordings SET upload_state = 'deleted', title = 'Deleted recording',
+          protected = 0, markdown_enabled = 0
+        WHERE id = ?1 AND upload_state IN ('ready', 'deleted') RETURNING *`, [uuid(id)]);
+      // Finished jobs only: an active job keeps its lease-fenced row and fails on its next run.
+      if (deleted) await execute(`UPDATE slop_markdown_jobs SET markdown = NULL, goal = '', updated_at = ${now}
+        WHERE recording_id = ?1 AND status NOT IN ${activeSql}`, [deleted.id]);
+      return deleted;
     },
     async createPart(recordingId, index) {
       if (!Number.isInteger(index) || index < 0 || index >= MAX_PART_COUNT) return null;
@@ -99,6 +108,10 @@ export function createD1Repository(db: D1DatabaseLike): Repository {
     getPart: (id, index) => part('SELECT * FROM slop_recording_parts WHERE recording_id = ?1 AND part_index = ?2', [uuid(id), index]),
     async listParts(id) {
       return (await rows('SELECT * FROM slop_recording_parts WHERE recording_id = ?1 ORDER BY part_index', [uuid(id)])).map(mapPart);
+    },
+    async deletePart(id, index) {
+      await execute(`DELETE FROM slop_recording_parts WHERE recording_id = ?1 AND part_index = ?2
+        AND EXISTS (SELECT 1 FROM slop_recordings r WHERE r.id = ?1 AND r.upload_state = 'deleted')`, [uuid(id), index]);
     },
     claimPart: (id, index, owner) => part(`UPDATE slop_recording_parts SET lease_owner = ?3, lease_until = ${leaseUntil},
         lease_version = lease_version + 1, updated_at = ${now}

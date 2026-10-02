@@ -97,6 +97,8 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
           createdAt: now().toISOString(), objectKey: `recordings/${id}/video`, transferId: null, uploadSha256: null, uploadAttempted: false,
           uploadState: 'pending', protected: false, markdownEnabled: false,
         });
+        // Checked first: deletion cleared the title, so the details no longer match.
+        if (recording.uploadState === 'deleted') throw new ApiError(409, 'recording_deleted', 'This recording was deleted. Start a new upload.');
         if (!sameInput(input, recording)) throw new ApiError(409, 'upload_request_conflict', 'This upload request was already used for a different recording.');
         if (recording.storageMode === 'parts') return reservationResponse(recording, recording.uploadState === 'ready');
         if (recording.uploadState === 'ready' || recording.uploadSha256) return reservationResponse(recording, true);
@@ -127,7 +129,7 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
           uploadId = isObject(input) ? input.uploadId : null;
         }
         if (!isUuid(uploadId)) throw new ApiError(400, 'invalid_upload', 'A valid upload token is required.');
-        if (!recording || recording.uploadId !== uploadId.toLowerCase()) throw new ApiError(404, 'upload_not_found', 'This upload could not be found.');
+        if (!recording || recording.uploadId !== uploadId.toLowerCase() || recording.uploadState === 'deleted') throw new ApiError(404, 'upload_not_found', 'This upload could not be found.');
         if (action === 'upload') {
           if (recording.storageMode === 'parts') return await uploadPart(request, resolve(runtime), repository, recording);
           return await uploadVideo(request, resolve(runtime), repository, recording);
@@ -162,6 +164,17 @@ export function createApiHandler(runtime: Resolvable<StorageRuntime>, options: A
           recording = await repository.completeRecording(id);
         }
         return json(await metadata(recording, true, auth, null));
+      }
+
+      if (!action && request.method === 'DELETE') {
+        // Any signed-in creator may delete; the read-only sharing view was refused above.
+        assertWrite(request, owner);
+        // Deleting again finishes removing the stored video of an interrupted deletion.
+        if (!recording || recording.uploadState === 'pending') throw notFound();
+        const deleted = await repository.deleteRecording(id);
+        if (!deleted) throw notFound();
+        await deleteStoredVideo(resolve(runtime), repository, deleted);
+        return new Response(null, { status: 204, headers: commonHeaders() });
       }
 
       if (!recording || recording.uploadState !== 'ready') throw notFound();
@@ -257,6 +270,30 @@ function reservationResponse(recording: RecordingRow, alreadyUploaded: boolean) 
     headers: { 'content-type': recording.contentType }, alreadyUploaded,
     ...(recording.storageMode === 'parts' ? { chunkSizeBytes: recording.chunkSizeBytes, partCount: recording.partCount } : {}),
   }, 201);
+}
+
+/**
+ * Removes a deleted recording's stored video. Each part's row goes once its object is gone, so a
+ * repeated deletion resumes where an interrupted one stopped. A Worker waits on at most six
+ * storage responses at once, so parts go six at a time.
+ */
+async function deleteStoredVideo(runtime: StorageRuntime, repository: Repository, recording: RecordingRow) {
+  if (recording.storageMode !== 'parts') {
+    await deleteObject(runtime, recording.objectKey, `delete:${recording.id}`);
+    return;
+  }
+  const parts = await repository.listParts(recording.id);
+  for (let start = 0; start < parts.length; start += 6) {
+    await Promise.all(parts.slice(start, start + 6).map(async part => {
+      await deleteObject(runtime, part.objectKey, `delete:${recording.id}:${part.index}`);
+      await repository.deletePart(recording.id, part.index);
+    }));
+  }
+}
+
+async function deleteObject(runtime: StorageRuntime, objectKey: string, idempotencyKey: string) {
+  try { await runtime.storage.deleteObject({ objectKey, idempotencyKey }); }
+  catch (error) { if (errorCode(error) !== 'storage_object_not_found') throw error; }
 }
 
 function pendingResponse() { return json({ state: 'pending', retryAfterSeconds: 2 }, 202, { 'retry-after': '2' }); }

@@ -29,6 +29,7 @@ Local development uses disk-backed private files in `.local/storage` and embedde
 - **Protect link** requires a permanent per-video token for metadata, playback, seeking and Markdown/downloads. It is access control, not end-to-end encryption.
 - **Generate Markdown** is separate from recording capacity and currently accepts videos up to 50 MiB. Larger videos can still be recorded, watched, downloaded and shared; management shows the AI limit. Only pressing **Generate** sends a video to Gemini. An empty goal produces a briefing; a custom goal can request a transcript or another format.
 - Markdown appears beneath the video and supports copy/download. Disabling the toggle hides it from viewers without deleting the saved result.
+- **Delete recording** on the management page asks for a confirmation, then removes the stored video (every part of a long recording) and the saved Markdown, and returns to the recorder. Its links stop working for everyone. The database keeps a tombstone row titled "Deleted recording", because Markdown jobs reference it and may still have to clean up Gemini resources; every route answers it as missing. If a deletion is interrupted, deleting again finishes it.
 
 Everyone with the shared access UUID has the same creator privileges in the management interface. Recipient requests use explicit public access, ignore creator cookies, and cannot modify settings or start AI work. Protected sharing links require their viewing token even in a signed-in creator's browser. Creator sessions use signed host-bound cookies for 30 days. Rotating the access UUID or session secret invalidates creator sessions; rotating `SHARE_TOKEN_SECRET` invalidates previously issued protected viewing links.
 
@@ -63,6 +64,8 @@ Server settings, installed through the hosting CLI's stdin-only secret workflow 
 - `GEMINI_MODEL` (default `gemini-3.8-flash`)
 
 Keep the access/share secrets compatible between environments because videos and settings are shared. Browser cookies remain host-bound. Test writes and migrations affect shared data. Keep schema changes additive and verify existing links before promotion.
+
+Deleted recordings are marked by an additive `deleted_at` column (`migrations/20261002090000_deleted_recordings.sql`), because the `upload_state` CHECK constraint cannot change. A backend from before this migration would still list such a tombstone as a ready recording without its video, so promote the compatible backend to both environments before deleting recordings that production serves.
 
 Recordings on ohmyho.st stay limited to 1 GiB (128 parts). The Postgres CHECK constraints on the recording size, part count and part index would have to be relaxed for more, which the hosting's additive-only migration contract does not allow; the Cloudflare schema (`migrations-d1/`) allows 10 GiB.
 
