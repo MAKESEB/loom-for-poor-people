@@ -472,6 +472,8 @@ async function uploadVideo(request: Request, runtime: StorageRuntime, repository
     await upstream.body?.cancel();
     if (!upstream.ok) {
       if (upstream.status >= 400 && upstream.status < 500) await repository.markUploadAttempt(recording.id, leaseOwner, false);
+      // 410: the reserved transfer expired before this attempt (R2 storage, src/server/r2-storage.ts).
+      if (upstream.status === 410) throw Object.assign(new Error('Upload expired'), { code: 'storage_upload_expired' });
       if (invalidLength || !digest) throw lengthError();
       throw new ApiError(502, 'upload_failed', 'The video could not be uploaded. Please try again.');
     }

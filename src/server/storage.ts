@@ -1,6 +1,37 @@
 import { createPrivateStorageClient } from '@ohmyhost/customer-runtime/storage';
 
-export type ManagedStorage = ReturnType<typeof createPrivateStorageClient>;
+/** A short-lived, server-side grant for one object operation. It never reaches clients. */
+export interface StorageCapability {
+  operation: 'GET' | 'PUT';
+  objectKey: string;
+  url: string;
+  expiresAt: string;
+  expectedContentLength: number | null;
+  requiredHeaders: Readonly<Record<string, string>>;
+}
+
+export interface StorageUploadInput {
+  idempotencyKey: string;
+  objectKey: string;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * The private-storage contract the API and job service rely on. The ohmyho.st
+ * Storage Gateway client implements it (resolveStorageRuntime below), and so does
+ * the R2 emulation used on Cloudflare Workers (src/server/r2-storage.ts).
+ */
+export interface ManagedStorage {
+  reserveUpload(input: Omit<StorageUploadInput, 'bytes'> & { contentLength: number }): Promise<
+    | { state: 'completed'; transferId: string }
+    | { state: 'ready'; transferId: string; capability: StorageCapability }
+  >;
+  completeUpload(transferId: string): Promise<{ state: 'completed' | 'pending'; transferId: string }>;
+  createSignedRead(objectKey: string): Promise<StorageCapability>;
+  deleteObject(input: { idempotencyKey: string; objectKey: string }): Promise<{ state: 'completed'; deletionId: string }>;
+  upload(input: StorageUploadInput): Promise<{ state: 'completed' | 'pending'; transferId: string }>;
+}
 
 export interface StorageRuntime {
   storage: ManagedStorage;
