@@ -54,6 +54,7 @@ export function createLocalStorage(root = resolve('.local/storage')) {
     },
     async deleteObject({ objectKey, idempotencyKey }) {
       await rm(objectPath(objectKey), { force: true });
+      await rm(`${objectPath(objectKey)}.type`, { force: true });
       return { state: 'completed', deletionId: idempotencyKey };
     },
     async upload(input) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLocalStorage } from '../src/dev/local-storage';
@@ -27,6 +27,11 @@ test('disk storage preserves completed uploads across restart and supports seeki
     const invalidRange = await restarted.capabilityFetch(new Request(read.url, { headers: { Range: 'bytes=100-' } }));
     assert.equal(invalidRange.status, 416);
     await assert.rejects(restarted.storage.reserveUpload({ ...input, contentLength: 9 }), /Conflicting/);
+
+    assert.equal((await restarted.storage.deleteObject({ objectKey: input.objectKey, idempotencyKey: 'delete-example' })).state, 'completed');
+    await assert.rejects(restarted.storage.createSignedRead(input.objectKey), /Missing object/);
+    assert.deepEqual(await readdir(join(directory, 'objects', 'recordings', 'example')), [], 'deleting leaves no bytes or metadata behind');
+    assert.equal((await restarted.storage.deleteObject({ objectKey: input.objectKey, idempotencyKey: 'delete-example' })).state, 'completed', 'deleting again is safe');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
