@@ -150,14 +150,15 @@ test('caller-chosen file names make uploads recoverable and returned names must 
   }
 });
 
-test('blank goals request a useful briefing and a configured model overrides the default', async () => {
+test('blank goals request a transcript and a configured model overrides the default', async () => {
   const client = createGeminiClient({
     apiKey: API_KEY,
     model: 'configured-model',
     fetch: fakeFetch(async (request) => {
       const body = await request.json();
       assert.equal(body.model, 'configured-model');
-      assert.match(JSON.stringify(body), /briefing/i);
+      assert.match(JSON.stringify(body), /Transcribe everything said/);
+      assert.match(JSON.stringify(body), /\[mm:ss\] timestamp/);
       assert.match(JSON.stringify(body), /language/i, 'the default should retain the video language');
       return Response.json({ id: 'interaction-123', status: 'in_progress', steps: [] });
     }),

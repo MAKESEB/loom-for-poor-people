@@ -9,7 +9,7 @@ const MAX_INTERACTION_BYTES = 96 * 1024 * 1024;
 const MAX_STRING_CHARACTERS = 256 * 1024;
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
-export const DEFAULT_GOAL = 'Create a concise briefing in Markdown: a short summary, key points, and actionable next steps when present. Use the language spoken in the recording unless the requested goal specifies another language.';
+export const DEFAULT_GOAL = 'Transcribe everything said in the recording, word for word, in Markdown. Start a new paragraph with a [mm:ss] timestamp whenever the speaker or topic changes, and label speakers when more than one can be told apart. Note on-screen text only where it is needed to follow what is said. If nothing is said, describe step by step what happens on screen instead. Use the language spoken in the recording unless the requested goal specifies another language.';
 
 export class GeminiError extends Error {
   constructor(
