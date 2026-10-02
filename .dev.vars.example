@@ -1,0 +1,12 @@
+# Worker secrets. For `wrangler dev`, copy this file to .dev.vars (gitignored) or run
+# `npm run cf:setup`, which generates the three required values. In production, set each one with
+# `npx wrangler secret put <NAME>`; never commit real values.
+
+# Required: the shared access code creators sign in with (a UUID is recommended).
+SLOP_ROOSTER_ACCESS_UUID=
+# Required, at least 32 random characters: signs creator session cookies.
+APP_SESSION_SECRET=
+# Required, at least 32 random characters: signs the permanent viewing tokens of protected links.
+SHARE_TOKEN_SECRET=
+# Optional: enables "Generate Markdown". Recording and sharing work without it.
+GEMINI_API_KEY=

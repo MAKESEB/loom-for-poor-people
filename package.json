@@ -13,7 +13,12 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "preview": "vite preview --host 127.0.0.1",
-    "setup": "node scripts/setup-local.mjs"
+    "setup": "node scripts/setup-local.mjs",
+    "cf:setup": "node scripts/setup-local.mjs .dev.vars",
+    "cf:dev": "npm run build && wrangler d1 migrations apply DB --local && wrangler dev",
+    "cf:migrate": "wrangler d1 migrations apply DB --remote",
+    "cf:deploy": "npm run build && npm run cf:migrate && wrangler deploy",
+    "deploy": "npm run cf:deploy"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
@@ -39,6 +44,29 @@
     "tailwindcss": "4.3.3",
     "tsx": "4.23.13",
     "typescript": "5.9.3",
-    "vite": "8.2.2"
+    "vite": "8.2.2",
+    "wrangler": "4.146.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "SLOP_ROOSTER_ACCESS_UUID": {
+        "description": "Required. The shared access code creators sign in with. Use a fresh UUID (for example from `uuidgen`) and keep it private."
+      },
+      "APP_SESSION_SECRET": {
+        "description": "Required. At least 32 random characters (for example `openssl rand -base64 48`); signs creator session cookies."
+      },
+      "SHARE_TOKEN_SECRET": {
+        "description": "Required. At least 32 random characters, different from the session secret; signs protected viewing links. Changing it invalidates issued protected links."
+      },
+      "GEMINI_API_KEY": {
+        "description": "Optional. A Gemini API key enables **Generate Markdown**. Recording and sharing work without it."
+      },
+      "DB": {
+        "description": "D1 database for recordings, sharing settings and Markdown jobs."
+      },
+      "RECORDINGS": {
+        "description": "Private R2 bucket for the video files."
+      }
+    }
   }
 }
